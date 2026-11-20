@@ -1,0 +1,60 @@
+{
+  "fill": {
+    "automatic-gradient": "srgb:0.15294,0.40392,0.58824,1.00000"
+  },
+  "groups": [
+    {
+      "name": "Window frame",
+      "layers": [
+        {
+          "image-name": "1-window-frame.png",
+          "name": "Window frame",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.35
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.2
+      }
+    },
+    {
+      "name": "Four seasons",
+      "layers": [
+        {
+          "image-name": "2-seasons.png",
+          "name": "Four seasons",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0.5
+      }
+    },
+    {
+      "name": "House",
+      "layers": [
+        {
+          "image-name": "3-house.png",
+          "name": "House",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.1
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

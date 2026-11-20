@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+__MACOSX/
+xcuserdata/
+*.xcuserstate
+
+# Swift
+.build/
+.swiftpm/
+dist/
+
+# Python (HomeViewLinux)
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+*.egg-info/
