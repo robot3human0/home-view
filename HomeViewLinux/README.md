@@ -78,5 +78,16 @@ cd HomeViewLinux
 
 Чтобы не трогать свои настройки при тестах: `XDG_CONFIG_HOME=/tmp/hv-test ./run.sh`.
 
+### Проверка совместимости с настоящим Swift-протоколом
+
+```bash
+./HomeViewLinux/tools/swift_check/run.sh
+```
+
+Собирает `HomeViewProtocol` iOS-команды в Docker (`swift:6.0-noble`, ~1 ГБ при первом запуске) и
+прогоняет все сообщения клиента через их `JSONDecoder`, а сообщения сервера от их `JSONEncoder` —
+через наш декодер. Запускать после каждого нового архива HomeView от iOS-команды. Код возврата
+не 0 — что-то разошлось. В рабочую копию ничего не пишется.
+
 Настройки хранятся в `~/.config/HomeView/HomeViewLinux.conf`, автозапуск —
 `~/.config/autostart/homeview-linux.desktop`.
