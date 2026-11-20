@@ -58,7 +58,11 @@ class Tray(QObject):
         self.icon.show()
 
     def _activated(self, reason) -> None:
-        if reason == QSystemTrayIcon.Trigger:
+        # В Ubuntu/Zorin (AppIndicator) меню по клику показывает сама панель, а геометрия значка
+        # неизвестна (пустая). Если открыть ещё и своё меню — оно появится в углу экрана, захватит
+        # мышь и закроет меню панели: клик «срабатывает не с первого раза». Поэтому своё меню —
+        # только для старых треев (XEmbed), где геометрия значка известна.
+        if reason == QSystemTrayIcon.Trigger and not self.icon.geometry().isEmpty():
             self.menu.popup(self.icon.geometry().center())
 
     def _changed(self) -> None:

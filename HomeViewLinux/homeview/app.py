@@ -35,7 +35,7 @@ class HomeViewApp(QObject):
         self.qapp = qapp
         self.settings = settings
         self.choice = choice
-        self.toasts = ToastManager()
+        self.toasts = ToastManager(settings.toast_scale)
         self.office = Office(self.settings, self.toasts)
         self.office.animate_throw = self._animate_throw
         self.office.peers_changed.connect(self._sync_peers)
@@ -137,12 +137,13 @@ class HomeViewApp(QObject):
 
     def _apply_settings(self) -> None:
         s = self.settings
-        self.apply_look(s.season, s.density, s.avatar_scale, s.text_scale, s.effects_enabled, s.fps)
+        self.apply_look(s.season, s.density, s.avatar_scale, s.text_scale, s.effects_enabled, s.fps, s.toast_scale)
 
     @measure("применение настроек")
     def apply_look(self, season: str, density: float, avatar_scale: float, text_scale: float,
-                   effects_enabled: bool, fps: int) -> None:
+                   effects_enabled: bool, fps: int, toast_scale: float = 1.5) -> None:
         """Применяет внешний вид сразу — и из сохранённых настроек, и как живой предпросмотр из окна настроек."""
+        self.toasts.scale = toast_scale
         self.season = seasons.resolve(season)
         for overlay in self.overlays:
             overlay.world.apply(self.season, density, avatar_scale, effects_enabled, text_scale)
@@ -196,13 +197,23 @@ class HomeViewApp(QObject):
     def open_settings(self) -> None:
         if self.settings_window is None:
             self.settings_window = SettingsWindow(self.settings, self.office.status_line, self.choice,
-                                                  self.restart, self.apply_look)
+                                                  self.restart, self.apply_look, self._toast_sample)
             self.settings_window.finished.connect(self._settings_closed)
         else:
             self.settings_window.load()
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
+
+    def _toast_sample(self, scale: float | None) -> None:
+        """Пример карточки для ползунка «Размер уведомлений» (None — убрать пример)."""
+        if scale is None:
+            self.toasts.dismiss_key("toast-sample")
+            return
+        self.toasts.post(Toast("☕", "Так будут выглядеть уведомления",
+                               f"Размер {scale:.1f}×. Например, приглашение на чай:",
+                               [ToastAction("Иду!", lambda: None, primary=True), ToastAction("Позже", lambda: None)],
+                               auto_dismiss=6, key="toast-sample"))
 
     def _settings_closed(self) -> None:
         if self.settings_window is not None:

@@ -33,39 +33,44 @@ class Toast:
 
 
 class _Card(QWidget):
-    def __init__(self, toast: Toast, on_close: Callable[["_Card"], None]) -> None:
+    def __init__(self, toast: Toast, on_close: Callable[["_Card"], None], scale: float = 1.0) -> None:
         super().__init__(None)
         self.toast = toast
         self._on_close = on_close
+        self.scale = scale
+        k = scale
+
+        def px(value: float) -> int:
+            return max(1, round(value * k))
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
                             | Qt.X11BypassWindowManagerHint | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.setFixedWidth(WIDTH)
-        self.setStyleSheet("""
-            QLabel { color: #F4F7FB; background: transparent; }
-            QLabel#title { font-weight: 600; font-size: 13px; }
-            QLabel#message { color: #C9D3E0; font-size: 12px; }
-            QLabel#icon { font-size: 22px; }
-            QPushButton { color: #F4F7FB; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.18);
-                          border-radius: 8px; padding: 5px 12px; font-size: 12px; }
-            QPushButton:hover { background: rgba(255,255,255,0.2); }
-            QPushButton[primary="true"] { background: #2F7FE0; border-color: #4C93EA; }
-            QPushButton[primary="true"]:hover { background: #3C8AEB; }
-            QToolButton { color: #9FB0C6; background: transparent; border: none; font-size: 14px; }
-            QToolButton:hover { color: #FFFFFF; }
+        self.setFixedWidth(px(WIDTH))
+        self.setStyleSheet(f"""
+            QLabel {{ color: #F4F7FB; background: transparent; }}
+            QLabel#title {{ font-weight: 600; font-size: {px(13)}px; }}
+            QLabel#message {{ color: #C9D3E0; font-size: {px(12)}px; }}
+            QLabel#icon {{ font-size: {px(22)}px; }}
+            QPushButton {{ color: #F4F7FB; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.18);
+                          border-radius: {px(8)}px; padding: {px(5)}px {px(12)}px; font-size: {px(12)}px; }}
+            QPushButton:hover {{ background: rgba(255,255,255,0.2); }}
+            QPushButton[primary="true"] {{ background: #2F7FE0; border-color: #4C93EA; }}
+            QPushButton[primary="true"]:hover {{ background: #3C8AEB; }}
+            QToolButton {{ color: #9FB0C6; background: transparent; border: none; font-size: {px(14)}px; }}
+            QToolButton:hover {{ color: #FFFFFF; }}
         """)
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(14, 12, 10, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(px(14), px(12), px(10), px(12))
+        root.setSpacing(px(10))
         icon = QLabel(toast.icon, objectName="icon")
         icon.setAlignment(Qt.AlignTop)
         root.addWidget(icon)
 
         column = QVBoxLayout()
-        column.setSpacing(4)
+        column.setSpacing(px(4))
         title = QLabel(toast.title, objectName="title")
         title.setWordWrap(True)
         column.addWidget(title)
@@ -75,8 +80,8 @@ class _Card(QWidget):
             column.addWidget(message)
         if toast.actions:
             row = QHBoxLayout()
-            row.setSpacing(8)
-            row.setContentsMargins(0, 6, 0, 0)
+            row.setSpacing(px(8))
+            row.setContentsMargins(0, px(6), 0, 0)
             for action in toast.actions:
                 button = QPushButton(action.title)
                 button.setProperty("primary", action.primary)
@@ -112,23 +117,25 @@ class _Card(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+        radius = 14 * self.scale
+        path.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
         painter.fillPath(path, QColor(18, 28, 44, 236))
         painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
         painter.drawPath(path)
 
 
 class ToastManager(QObject):
-    def __init__(self) -> None:
+    def __init__(self, scale: float = 1.0) -> None:
         super().__init__()
         self._cards: list[_Card] = []
+        self.scale = scale
 
     def post(self, toast: Toast) -> None:
         if toast.key:
             for card in list(self._cards):
                 if card.toast.key == toast.key:
                     card.dismiss()
-        card = _Card(toast, self._closed)
+        card = _Card(toast, self._closed, self.scale)
         self._cards.insert(0, card)
         while len(self._cards) > MAX_VISIBLE:
             self._cards[-1].dismiss()
@@ -154,5 +161,5 @@ class ToastManager(QObject):
         y = area.top() + MARGIN
         for card in self._cards:
             card.adjustSize()
-            card.move(QPoint(area.right() - WIDTH - MARGIN, y))
+            card.move(QPoint(area.right() - card.width() - MARGIN, y))
             y += card.height() + GAP

@@ -234,6 +234,15 @@ class Settings(QObject):
         self._q.setValue("textScale", float(value))
 
     @property
+    def toast_scale(self) -> float:
+        """Размер карточек-уведомлений справа вверху."""
+        return self._float("toastScale", 1.5, 1.0, 3.0)
+
+    @toast_scale.setter
+    def toast_scale(self, value: float) -> None:
+        self._q.setValue("toastScale", float(value))
+
+    @property
     def fps(self) -> int:
         value = self._int("fps", 30)
         return value if value in (20, 30, 60) else 30

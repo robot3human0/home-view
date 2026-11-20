@@ -113,13 +113,15 @@ class AvatarPreview(QWidget):
 
 class SettingsWindow(QDialog):
     def __init__(self, settings: Settings, status_text: Callable[[], str], choice: gpu.Choice,
-                 restart: Callable[[], None], preview: Callable[..., None]) -> None:
+                 restart: Callable[[], None], preview: Callable[..., None],
+                 toast_sample: Callable[[float | None], None]) -> None:
         super().__init__(None)
         self.settings = settings
         self._status_text = status_text
         self._choice = choice
         self._restart = restart
         self._preview = preview
+        self._toast_sample = toast_sample
         self._loading = False
         self._saved = False
         # Живой предпросмотр: изменения экрана применяются сразу, но не чаще раза в 80 мс
@@ -186,6 +188,9 @@ class SettingsWindow(QDialog):
         self.density_slider = self._slider(10, 200)
         self.scale_slider = self._slider(60, 400)
         self.text_slider = self._slider(100, 400)
+        self.toast_slider = self._slider(100, 300)
+        self.toast_value = QLabel()
+        self.toast_slider.valueChanged.connect(lambda v: self.toast_value.setText(f"{v / 100:.1f}×"))
         self.scale_value = QLabel()
         self.text_value = QLabel()
         self.scale_slider.valueChanged.connect(lambda v: self.scale_value.setText(f"{v / 100:.1f}×"))
@@ -207,6 +212,7 @@ class SettingsWindow(QDialog):
         screen_form.addRow("Плотность осадков:", self.density_slider)
         screen_form.addRow("Размер человечков:", self._with_value(self.scale_slider, self.scale_value))
         screen_form.addRow("Размер надписей:", self._with_value(self.text_slider, self.text_value))
+        screen_form.addRow("Размер уведомлений:", self._with_value(self.toast_slider, self.toast_value))
         screen_form.addRow("Плавность:", self.fps_combo)
         screen_form.addRow("Чем рисовать:", self.renderer_combo)
         screen_form.addRow(self.renderer_label)
@@ -230,8 +236,12 @@ class SettingsWindow(QDialog):
         self.hat_combo.currentIndexChanged.connect(self._refresh_preview)
         self.season_combo.currentIndexChanged.connect(self._refresh_preview)
         self.office_enabled.toggled.connect(self._update_enabled)
-        for slider in (self.density_slider, self.scale_slider, self.text_slider):
+        for slider in (self.density_slider, self.scale_slider, self.text_slider, self.toast_slider):
             slider.valueChanged.connect(self._schedule_preview)
+        # Пример карточки — пока двигают ползунок размера уведомлений
+        self._toast_sample_timer = QTimer(self, singleShot=True, interval=250)
+        self._toast_sample_timer.timeout.connect(self._show_toast_sample)
+        self.toast_slider.valueChanged.connect(lambda _: None if self._loading else self._toast_sample_timer.start())
         for combo in (self.season_combo, self.fps_combo):
             combo.currentIndexChanged.connect(self._schedule_preview)
         self.effects_check.toggled.connect(self._schedule_preview)
@@ -266,13 +276,19 @@ class SettingsWindow(QDialog):
     def _apply_preview(self) -> None:
         self._preview(self.season_combo.currentData() or "auto", self.density_slider.value() / 100,
                       self.scale_slider.value() / 100, self.text_slider.value() / 100,
-                      self.effects_check.isChecked(), self.fps_combo.currentData() or 30)
+                      self.effects_check.isChecked(), self.fps_combo.currentData() or 30,
+                      self.toast_slider.value() / 100)
+
+    def _show_toast_sample(self) -> None:
+        self._apply_preview()  # сначала масштаб, потом пример
+        self._toast_sample(self.toast_slider.value() / 100)
 
     def _revert_preview(self) -> None:
         """Отмена: экран возвращается к сохранённым настройкам."""
         self._preview_timer.stop()
         s = self.settings
-        self._preview(s.season, s.density, s.avatar_scale, s.text_scale, s.effects_enabled, s.fps)
+        self._preview(s.season, s.density, s.avatar_scale, s.text_scale, s.effects_enabled, s.fps, s.toast_scale)
+        self._toast_sample(None)
 
     def reject(self) -> None:
         if not self._saved:
@@ -293,6 +309,8 @@ class SettingsWindow(QDialog):
         self.density_slider.setValue(round(s.density * 100))
         self.scale_slider.setValue(round(s.avatar_scale * 100))
         self.text_slider.setValue(round(s.text_scale * 100))
+        self.toast_slider.setValue(round(s.toast_scale * 100))
+        self.toast_value.setText(f"{s.toast_scale:.1f}×")
         self.scale_value.setText(f"{s.avatar_scale:.1f}×")
         self.text_value.setText(f"{s.text_scale:.1f}×")
         self.fps_combo.setCurrentIndex(max(0, self.fps_combo.findData(s.fps)))
@@ -384,6 +402,7 @@ class SettingsWindow(QDialog):
             density=self.density_slider.value() / 100,
             avatar_scale=self.scale_slider.value() / 100,
             text_scale=self.text_slider.value() / 100,
+            toast_scale=self.toast_slider.value() / 100,
             fps=self.fps_combo.currentData(),
             auto_away=self.auto_away_check.isChecked(),
             autostart=self.autostart_check.isChecked(),
