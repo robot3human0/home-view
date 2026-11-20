@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Callable
 
 from PySide6.QtCore import QObject, QRectF, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from . import paths, season as seasons
@@ -58,12 +58,22 @@ class Tray(QObject):
         self.icon.show()
 
     def _activated(self, reason) -> None:
-        # В Ubuntu/Zorin (AppIndicator) меню по клику показывает сама панель, а геометрия значка
-        # неизвестна (пустая). Если открыть ещё и своё меню — оно появится в углу экрана, захватит
-        # мышь и закроет меню панели: клик «срабатывает не с первого раза». Поэтому своё меню —
-        # только для старых треев (XEmbed), где геометрия значка известна.
-        if reason == QSystemTrayIcon.Trigger and not self.icon.geometry().isEmpty():
-            self.menu.popup(self.icon.geometry().center())
+        # Как ведёт себя панель Ubuntu/Zorin (AppIndicator), проверено через D-Bus:
+        #   правый клик → панель сама показывает наше меню (ContextMenu);
+        #   левый клик  → панель вызывает Activate (Qt сообщает ItemIsMenu=false) и ничего не
+        #                 показывает — меню должны открыть мы. Координаты значка неизвестны
+        #                 (геометрия пустая), поэтому открываем у курсора.
+        # Открываем с задержкой: в момент клика мышь ещё захвачена панелью, и мгновенно
+        # открытое меню не получит захват и тут же закроется.
+        if reason == QSystemTrayIcon.Trigger:
+            QTimer.singleShot(150, self._popup_at_cursor)
+
+    def _popup_at_cursor(self) -> None:
+        if self.menu.isVisible():
+            self.menu.close()
+            return
+        geometry = self.icon.geometry()
+        self.menu.popup(geometry.center() if not geometry.isEmpty() else QCursor.pos())
 
     def _changed(self) -> None:
         self._update_icon()

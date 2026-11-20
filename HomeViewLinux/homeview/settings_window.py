@@ -70,7 +70,7 @@ class AvatarPreview(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setFixedSize(180, 230)
+        self.setFixedSize(230, 330)
         self.season = "winter"
         self.avatar: PeerAvatar | None = None
         self._timer = QTimer(self)
@@ -80,7 +80,7 @@ class AvatarPreview(QWidget):
     def set_info(self, info: PeerInfo, season_kind: str) -> None:
         self.season = season_kind
         if self.avatar is None:
-            self.avatar = PeerAvatar(info, self.width() / 2, 2.6, self.devicePixelRatioF())
+            self.avatar = PeerAvatar(info, self.width() / 2, 4.2, self.devicePixelRatioF(), text_scale=1.3)
             self.avatar.pause = 1e9
         else:
             self.avatar.update_info(info)
@@ -170,12 +170,14 @@ class SettingsWindow(QDialog):
         figure_row.addWidget(self.preview)
         figure_form = QFormLayout()
         figure_form.addRow("Головной убор:", self.hat_combo)
-        figure_form.addRow("Цвет убора:", self.hat_color)
+        self.hat_color_label = QLabel()
+        figure_form.addRow(self.hat_color_label, self.hat_color)
         figure_form.addRow("Куртка:", self.vest_color)
         figure_form.addRow("Кожа:", self.skin_color)
-        hint = QLabel("Тюбетейка и соломенная шляпа — со своим узором,\nцвет меняется только у ленты шляпы.")
-        hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-        figure_form.addRow(hint)
+        self.hat_hint = QLabel()
+        self.hat_hint.setWordWrap(True)
+        self.hat_hint.setStyleSheet("font-style: italic;")
+        figure_form.addRow(self.hat_hint)
         figure_row.addLayout(figure_form, 1)
 
         # Экран
@@ -234,6 +236,8 @@ class SettingsWindow(QDialog):
         for signal in (self.name_edit.textChanged, self.team_edit.textChanged):
             signal.connect(self._refresh_preview)
         self.hat_combo.currentIndexChanged.connect(self._refresh_preview)
+        self.hat_combo.currentIndexChanged.connect(self._update_hat_color_row)
+        self._update_hat_color_row()
         self.season_combo.currentIndexChanged.connect(self._refresh_preview)
         self.office_enabled.toggled.connect(self._update_enabled)
         for slider in (self.density_slider, self.scale_slider, self.text_slider, self.toast_slider):
@@ -325,6 +329,19 @@ class SettingsWindow(QDialog):
     def _style(self) -> AvatarStyle:
         return AvatarStyle(hat=self.hat_combo.currentData(), hat_color=self.hat_color.value,
                            vest_color=self.vest_color.value, skin_color=self.skin_color.value)
+
+    def _update_hat_color_row(self, *_) -> None:
+        """Цвет перекрашивает не все уборы (так нарисованы спрайты Mac-версии) — подписываем, что именно."""
+        hat = self.hat_combo.currentData()
+        label, hint, enabled = {
+            "beanie": ("Цвет шапки:", "Перекрашивается вся шапка, помпон остаётся белым.", True),
+            "cap": ("Цвет кепки:", "Перекрашивается вся кепка.", True),
+            "strawHat": ("Цвет ленты:", "У соломенной шляпы перекрашивается только лента на тулье.", True),
+            "doppi": ("Цвет убора:", "У тюбетейки свой узор — цвет не меняется.", False),
+        }.get(hat, ("Цвет убора:", "", True))
+        self.hat_color_label.setText(label)
+        self.hat_hint.setText(hint)
+        self.hat_color.setEnabled(enabled)
 
     def _refresh_preview(self) -> None:
         name = self.name_edit.text().strip() or "Без имени"
