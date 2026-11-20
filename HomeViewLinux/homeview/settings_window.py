@@ -111,12 +111,18 @@ class AvatarPreview(QWidget):
 
 class SettingsWindow(QDialog):
     def __init__(self, settings: Settings, status_text: Callable[[], str], choice: gpu.Choice,
-                 restart: Callable[[], None]) -> None:
+                 restart: Callable[[], None], preview: Callable[..., None]) -> None:
         super().__init__(None)
         self.settings = settings
         self._status_text = status_text
         self._choice = choice
         self._restart = restart
+        self._preview = preview
+        self._loading = False
+        self._saved = False
+        # Живой предпросмотр: изменения экрана применяются сразу, но не чаще раза в 80 мс
+        self._preview_timer = QTimer(self, singleShot=True, interval=80)
+        self._preview_timer.timeout.connect(self._apply_preview)
         self.setWindowTitle("HomeView — настройки")
         self.setMinimumWidth(620)
 
@@ -222,6 +228,11 @@ class SettingsWindow(QDialog):
         self.hat_combo.currentIndexChanged.connect(self._refresh_preview)
         self.season_combo.currentIndexChanged.connect(self._refresh_preview)
         self.office_enabled.toggled.connect(self._update_enabled)
+        for slider in (self.density_slider, self.scale_slider, self.text_slider):
+            slider.valueChanged.connect(self._schedule_preview)
+        for combo in (self.season_combo, self.fps_combo):
+            combo.currentIndexChanged.connect(self._schedule_preview)
+        self.effects_check.toggled.connect(self._schedule_preview)
 
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status)
@@ -246,7 +257,29 @@ class SettingsWindow(QDialog):
         slider.setPageStep(20)
         return slider
 
+    def _schedule_preview(self, *_) -> None:
+        if not self._loading:
+            self._preview_timer.start()
+
+    def _apply_preview(self) -> None:
+        self._preview(self.season_combo.currentData() or "auto", self.density_slider.value() / 100,
+                      self.scale_slider.value() / 100, self.text_slider.value() / 100,
+                      self.effects_check.isChecked(), self.fps_combo.currentData() or 30)
+
+    def _revert_preview(self) -> None:
+        """Отмена: экран возвращается к сохранённым настройкам."""
+        self._preview_timer.stop()
+        s = self.settings
+        self._preview(s.season, s.density, s.avatar_scale, s.text_scale, s.effects_enabled, s.fps)
+
+    def reject(self) -> None:
+        if not self._saved:
+            self._revert_preview()
+        super().reject()
+
     def load(self) -> None:
+        self._loading = True
+        self._saved = False
         s = self.settings
         self.office_enabled.setChecked(s.office_enabled)
         self.name_edit.setText(s.display_name)
@@ -267,6 +300,7 @@ class SettingsWindow(QDialog):
         self._update_enabled()
         self._update_status()
         self._refresh_preview()
+        self._loading = False
 
     def _style(self) -> AvatarStyle:
         return AvatarStyle(hat=self.hat_combo.currentData(), hat_color=self.hat_color.value,
@@ -353,6 +387,8 @@ class SettingsWindow(QDialog):
             autostart=self.autostart_check.isChecked(),
             renderer=renderer,
         )
+        self._saved = True
+        self._preview_timer.stop()
         self.accept()
         if renderer_changed:
             answer = QMessageBox.question(None, "Перезапустить HomeView?",

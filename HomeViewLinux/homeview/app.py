@@ -132,12 +132,20 @@ class HomeViewApp(QObject):
             overlay.update_input_region()
 
     def _apply_settings(self) -> None:
-        self.season = seasons.resolve(self.settings.season)
+        s = self.settings
+        self.apply_look(s.season, s.density, s.avatar_scale, s.text_scale, s.effects_enabled, s.fps)
+
+    def apply_look(self, season: str, density: float, avatar_scale: float, text_scale: float,
+                   effects_enabled: bool, fps: int) -> None:
+        """Применяет внешний вид сразу — и из сохранённых настроек, и как живой предпросмотр из окна настроек."""
+        self.season = seasons.resolve(season)
         for overlay in self.overlays:
-            overlay.world.apply(self.season, self.settings.density, self.settings.avatar_scale,
-                                self.settings.effects_enabled, self.settings.text_scale)
+            overlay.world.apply(self.season, density, avatar_scale, effects_enabled, text_scale)
             overlay.update()
-        self._frame_timer.start(round(1000 / self.settings.fps))
+            overlay.update_input_region()
+        interval = round(1000 / fps)
+        if self._frame_timer.interval() != interval or not self._frame_timer.isActive():
+            self._frame_timer.start(interval)
 
     def _check_season(self) -> None:
         if self.settings.season == "auto" and seasons.resolve("auto").kind != self.season.kind:
@@ -183,7 +191,7 @@ class HomeViewApp(QObject):
     def open_settings(self) -> None:
         if self.settings_window is None:
             self.settings_window = SettingsWindow(self.settings, self.office.status_line, self.choice,
-                                                  self.restart)
+                                                  self.restart, self.apply_look)
             self.settings_window.finished.connect(self._settings_closed)
         else:
             self.settings_window.load()

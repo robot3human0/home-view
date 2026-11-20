@@ -67,10 +67,14 @@ cd home-view && git switch linux-client
 
 ```bash
 cd HomeViewLinux
-.venv/bin/python tools/mock_server.py --bots 4 --advertise   # мок-сервер с ботами-коллегами
-./run.sh --debug                                              # клиент (найдёт мок через mDNS)
+.venv/bin/python tools/mock_server.py --bots 4                # мок-сервер с ботами-коллегами
+./run.sh --debug                                              # в настройках адрес: 127.0.0.1
 .venv/bin/python -m unittest discover -s tests               # тесты протокола
 ```
+
+> ⚠️ **Не запускайте мок с `--advertise` в офисной сети.** Он объявит себя через mDNS как сервер
+> HomeView, и Mac-клиенты коллег могут подключиться к нему вместо настоящего Mac mini. Флаг —
+> только для изолированной сети (или дома).
 
 Мок-сервер **строго проверяет формат** каждого сообщения клиента (как его ждёт Swift) и пишет
 `ОШИБКА ФОРМАТА`, если что-то не так. Боты сами машут, кидаются, пишут, зовут на чай и в игры,

@@ -210,15 +210,18 @@ class Office(QObject):
                 if peer.id != self.my_id:
                     self.peers[peer.id] = peer
             self.rooms = {r.id: r for r in (RoomInfo.from_json(raw) for raw in data.get("rooms", []))}
+            log.info("Сервер принял: в сети %d, комнат %d", len(self.peers), len(self.rooms))
             self._set_connection("connected", self.client.server_label)
             self.peers_changed.emit()
             self.toasts.post(Toast("👋", "Вы в офисе", f"Сейчас в сети: {len(self.peers)}", auto_dismiss=4,
                                    key="welcome"))
         elif case == "rejected":
             reason = translate_server_text(str(data.get("reason", "")))
+            log.warning("Сервер отказал: %s (%s)", reason, data.get("reason"))
             self._set_connection("failed", reason)
             self.toasts.post(Toast("⚠️", "Не удалось подключиться к офису", reason, auto_dismiss=10, key="rejected"))
         elif case == "notice":
+            log.info("Сервер сообщает: %s", data.get("text"))
             self.toasts.post(Toast("ℹ️", translate_server_text(str(data.get("text", ""))), auto_dismiss=4))
         elif case in ("peerJoined", "peerUpdated"):
             if isinstance(message.value, dict):

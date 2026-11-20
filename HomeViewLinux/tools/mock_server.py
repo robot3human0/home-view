@@ -374,7 +374,8 @@ def main() -> int:
     parser.add_argument("--code", default="", help="код офиса (пусто — без кода)")
     parser.add_argument("--bots", type=int, default=3, help="сколько ботов-коллег")
     parser.add_argument("--quiet", action="store_true", help="боты сами ничего не делают, только отвечают")
-    parser.add_argument("--advertise", action="store_true", help="объявить сервер через mDNS")
+    parser.add_argument("--advertise", action="store_true",
+                        help="объявить сервер через mDNS (НЕ в офисной сети: Mac-клиенты коллег могут подключиться к моку)")
     parser.add_argument("--debug", action="store_true", help="печатать весь JSON")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
