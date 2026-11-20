@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDia
 from . import art, gpu, season as seasons
 from .avatar import PeerAvatar
 from .protocol import AvatarStyle, PeerInfo
+from .profiling import measure
 from .settings import Settings
 
 HAT_TITLES = {"doppi": "Тюбетейка", "cap": "Кепка", "beanie": "Шапка", "strawHat": "Соломенная шляпа"}
@@ -92,6 +93,7 @@ class AvatarPreview(QWidget):
             self.avatar.walk_time += 0.033
             self.update()
 
+    @measure("настройки: предпросмотр человечка")
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)

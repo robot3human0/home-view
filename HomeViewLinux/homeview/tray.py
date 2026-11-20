@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from . import paths, season as seasons
 from .office import STATUS_TITLES, Office
+from .profiling import measure
 from .settings import Settings
 
 
@@ -45,11 +46,14 @@ class Tray(QObject):
         self.icon.activated.connect(self._activated)
         self._submenus: list[QMenu] = []
         self._icon_emoji = ""
+        self._tooltip = ""
+        self._signature: tuple | None = None
         self._rebuild_timer = QTimer(self, singleShot=True, interval=150)
         self._rebuild_timer.timeout.connect(self._changed)
         for signal in (office.state_changed, office.peers_changed, settings.changed):
             signal.connect(self._rebuild_timer.start)
-        self.menu.aboutToShow.connect(self.rebuild)
+        # Не пересобираем меню при открытии: в Ubuntu/Zorin оно уходит в панель через D-Bus,
+        # и пересборка в момент показа заставляет панель заново тянуть всё дерево — меню «фризит».
         self.rebuild()
         self.icon.show()
 
@@ -58,10 +62,21 @@ class Tray(QObject):
             self.menu.popup(self.icon.geometry().center())
 
     def _changed(self) -> None:
+        self._update_icon()
         if self.menu.isVisible():
-            self._update_icon()  # открытое меню не трогаем — пересоберётся при следующем показе
-        else:
+            self._rebuild_timer.start(1000)  # открытое меню не трогаем — попробуем позже
+            return
+        if self._menu_signature() != self._signature:
             self.rebuild()
+
+    def _menu_signature(self) -> tuple:
+        """Всё, от чего зависит содержимое меню: если не изменилось — пересборка не нужна."""
+        office, settings = self.office, self.settings
+        lobbies = tuple(sorted((r.host_id, r.game) for r in office.rooms.values() if r.phase == "lobby"))
+        peers = tuple((p.id, p.name, p.team, p.status) for p in office.online_peers())
+        return (office.status_line(), office.connection, office.effective_status, settings.my_status,
+                peers, tuple(sorted(settings.hidden_peers)), lobbies, settings.season,
+                seasons.resolve(settings.season).kind, settings.effects_enabled)
 
     def _update_icon(self) -> None:
         current = seasons.resolve(self.settings.season)
@@ -71,15 +86,20 @@ class Tray(QObject):
             if icon.isNull() and paths.app_icon().exists():
                 icon = QIcon(str(paths.app_icon()))
             self.icon.setIcon(icon)
-        self.icon.setToolTip(f"HomeView — {current.title}\n{self.office.status_line()}")
+        tooltip = f"HomeView — {current.title}\n{self.office.status_line()}"
+        if tooltip != self._tooltip:
+            self._tooltip = tooltip
+            self.icon.setToolTip(tooltip)
 
     def _submenu(self, parent: QMenu, title: str) -> QMenu:
         sub = parent.addMenu(title)
         self._submenus.append(sub)
         return sub
 
+    @measure("трей: пересборка меню")
     def rebuild(self) -> None:
         self._update_icon()
+        self._signature = self._menu_signature()
         current = seasons.resolve(self.settings.season)
         menu = self.menu
         menu.clear()

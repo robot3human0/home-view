@@ -23,6 +23,7 @@ from PySide6.QtOpenGL import QOpenGLBuffer, QOpenGLShader, QOpenGLShaderProgram,
 
 from . import art
 from .particles import BASE_POINTS, SPAWN_MARGIN, ParticleSystem
+from .profiling import measure
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +80,7 @@ def travel_for(ground_y: float) -> float:
     return ground_y + TOP * 2
 
 
+@measure("GPU: генерация частиц")
 def generate(system: ParticleSystem) -> list[bytes]:
     """Начальные параметры частиц для каждого слоя (по тем же правилам, что и Python-версия)."""
     result = []

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QWidget
 
 from . import x11
 from .gl_particles import GLParticleRenderer
+from .profiling import measure
 from .world import World
 
 WINDOW_FLAGS = (Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.X11BypassWindowManagerHint
@@ -94,6 +95,7 @@ class GLOverlayWindow(QOpenGLWindow, _OverlayMixin):
         self.create()
         self.update_input_region(force=True)
 
+    @measure("кадр: отрисовка окна (GL)")
     def paintGL(self) -> None:
         painter = QPainter(self)
         painter.setCompositionMode(QPainter.CompositionMode_Source)
@@ -153,6 +155,7 @@ class RasterOverlayWindow(QWidget, _OverlayMixin):
     def devicePixelRatio(self) -> float:  # noqa: N802 — единый интерфейс с QWindow
         return self.devicePixelRatioF()
 
+    @measure("кадр: отрисовка окна (CPU)")
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         self._paint_world(painter, event.rect())

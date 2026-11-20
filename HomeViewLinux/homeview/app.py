@@ -6,13 +6,15 @@ import logging
 import os
 import sys
 import time
+import zlib
 
 from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QCursor, QGuiApplication, QScreen
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from . import art, gpu, paths, season as seasons, x11
+from . import art, gpu, paths, profiling, season as seasons, x11
+from .profiling import measure
 from .office import Office
 from .overlay import create_overlay
 from .settings import Settings
@@ -23,7 +25,8 @@ from .world import World
 
 log = logging.getLogger(__name__)
 
-INSTANCE_KEY = f"homeview-linux-{os.getuid()}"
+# Один экземпляр на папку настроек (тестовый запуск с другим XDG_CONFIG_HOME не мешает основному)
+INSTANCE_KEY = f"homeview-linux-{os.getuid()}-{zlib.crc32(os.environ.get('XDG_CONFIG_HOME', '').encode()):08x}"
 
 
 class HomeViewApp(QObject):
@@ -119,6 +122,7 @@ class HomeViewApp(QObject):
 
     # MARK: - Кадр
 
+    @measure("кадр: логика")
     def _frame(self) -> None:
         now = time.monotonic()
         dt = min(max(now - self._last_frame, 0.0), 0.1)
@@ -135,6 +139,7 @@ class HomeViewApp(QObject):
         s = self.settings
         self.apply_look(s.season, s.density, s.avatar_scale, s.text_scale, s.effects_enabled, s.fps)
 
+    @measure("применение настроек")
     def apply_look(self, season: str, density: float, avatar_scale: float, text_scale: float,
                    effects_enabled: bool, fps: int) -> None:
         """Применяет внешний вид сразу — и из сохранённых настроек, и как живой предпросмотр из окна настроек."""
@@ -278,6 +283,7 @@ def run(argv: list[str]) -> int:
                             "HomeView для Linux работает только в сессии X11.\n"
                             f"Сейчас платформа: {qapp.platformName()}")
 
+    profiling.start()
     app = HomeViewApp(qapp, settings, choice)
 
     QLocalServer.removeServer(INSTANCE_KEY)

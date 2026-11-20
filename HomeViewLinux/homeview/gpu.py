@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -213,6 +214,7 @@ def choose(mode: str) -> Choice:
     return Choice(mode, "cpu", notes=notes)
 
 
+@functools.lru_cache(maxsize=1)
 def describe_available() -> dict[str, str | None]:
     """Для окна настроек: название карты каждого типа (None — нет)."""
     gpus = list_gpus()

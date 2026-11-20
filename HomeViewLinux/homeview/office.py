@@ -14,6 +14,7 @@ from . import protocol, x11
 from .net import NetworkClient
 from .protocol import Message, PeerInfo, RoomInfo, game_title
 from .season import TEA_LATER, TEA_TEXT, TEA_YES
+from .profiling import measure
 from .settings import Settings
 from .toasts import Toast, ToastAction, ToastManager
 
@@ -201,6 +202,7 @@ class Office(QObject):
 
     # MARK: - Сообщения сервера
 
+    @measure("сообщение сервера")
     def _handle(self, message: Message) -> None:
         case, data = message.case, message.data
         if case == "welcome":
