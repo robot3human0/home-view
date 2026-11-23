@@ -28,6 +28,11 @@ class Season:
     particle_title: str
     projectile_title: str
     layers: tuple[ParticleLayer, ...]
+    accumulation: float            # сколько осадков копится на земле (снег — 1)
+    pile_fill: int                 # цвет сугроба 0xRRGGBB
+    pile_stroke: tuple[int, float]  # цвет контура и тени, прозрачность контура
+    pile_sprites: tuple[str, ...] = ()  # из чего «набрана» куча (наше дополнение; зимой и летом — сплошная)
+    pile_under: int = 0                 # цвет «тени» между спрайтами кучи
 
 
 SEASONS: dict[str, Season] = {
@@ -38,6 +43,7 @@ SEASONS: dict[str, Season] = {
             ParticleLayer("hv_p_flake_soft", 28, 44, 0.42, 0.9, 0.0, 0.18, 0),
             ParticleLayer("hv_p_flake_crystal", 16, 64, 0.62, 1.0, 0.6, 0.18, 6),
         ),
+        1.0, 0xFFFFFF, (0xA9B9CF, 0.95),
     ),
     "spring": Season(
         "spring", "Весна", "🌸", "Лепестки урюка", "цветочный шарик",
@@ -46,6 +52,7 @@ SEASONS: dict[str, Season] = {
             ParticleLayer("hv_p_petal_pink", 11, 36, 0.5, 0.95, 1.6, 0.5, 24),
             ParticleLayer("hv_p_petal_pink", 6, 50, 0.7, 1.0, 2.0, 0.5, 30),
         ),
+        0.7, 0xFCE4EC, (0xF48FB1, 0.9), ("hv_p_petal_pink", "hv_p_petal_white"), 0xF3A6C0,
     ),
     "summer": Season(
         "summer", "Лето", "☀️", "Тополиный пух", "водяной шарик",
@@ -54,6 +61,7 @@ SEASONS: dict[str, Season] = {
             ParticleLayer("hv_p_fluff", 5, 16, 0.6, 0.85, 0.4, 1.2, 34),
             ParticleLayer("hv_p_fluff", 3, 22, 0.85, 0.9, 0.5, 1.2, 40),
         ),
+        0.35, 0xF7F5EE, (0xD7CCC8, 0.9),
     ),
     "autumn": Season(
         "autumn", "Осень", "🍂", "Листья", "листяной шарик",
@@ -62,6 +70,7 @@ SEASONS: dict[str, Season] = {
             ParticleLayer("hv_p_leaf_orange", 9, 42, 0.6, 0.95, 2.0, 0.45, 30),
             ParticleLayer("hv_p_leaf_red", 5, 56, 0.82, 1.0, 2.4, 0.45, 36),
         ),
+        0.8, 0xE8A04C, (0xB5651D, 0.9), ("hv_p_leaf_gold", "hv_p_leaf_orange", "hv_p_leaf_red"), 0x8A4B1C,
     ),
 }
 

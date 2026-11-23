@@ -59,7 +59,7 @@ class HomeViewApp(QObject):
         qapp.primaryScreenChanged.connect(lambda _: self._rebuild_overlays())
 
         self._rebuild_overlays()
-        self.tray = Tray(self.settings, self.office, self.open_settings, self.quit)
+        self.tray = Tray(self.settings, self.office, self.open_settings, self.quit, self.clear_snow)
         self._apply_settings()
         self.office.apply_settings()
 
@@ -134,6 +134,11 @@ class HomeViewApp(QObject):
             world.tick(dt)
             overlay.update()
             overlay.update_input_region()
+
+    def clear_snow(self) -> None:
+        for overlay in self.overlays:
+            overlay.world.clear_snow()
+            overlay.update()
 
     def _apply_settings(self) -> None:
         s = self.settings

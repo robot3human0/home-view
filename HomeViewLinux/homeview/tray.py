@@ -34,12 +34,13 @@ def emoji_icon(emoji: str) -> QIcon:
 
 class Tray(QObject):
     def __init__(self, settings: Settings, office: Office, open_settings: Callable[[], None],
-                 quit_app: Callable[[], None]) -> None:
+                 quit_app: Callable[[], None], clear_snow: Callable[[], None]) -> None:
         super().__init__()
         self.settings = settings
         self.office = office
         self._open_settings = open_settings
         self._quit = quit_app
+        self._clear_snow = clear_snow
         self.icon = QSystemTrayIcon(self)
         self.menu = QMenu()
         self.icon.setContextMenu(self.menu)
@@ -169,6 +170,7 @@ class Tray(QObject):
         effects.setChecked(self.settings.effects_enabled)
         effects.triggered.connect(lambda on: self.settings.save(effects_enabled=on))
         menu.addAction(effects)
+        menu.addAction("🧹  Убрать снег", self._clear_snow)
         menu.addSeparator()
         menu.addAction("⚙  Настройки…", self._open_settings)
         menu.addAction("Выход", self._quit)

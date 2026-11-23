@@ -1,4 +1,4 @@
-"""Мир одного монитора: осадки, человечки коллег (только на основном мониторе), эффекты."""
+"""Мир одного монитора: осадки, снег на земле, человечки коллег (только на основном мониторе), эффекты."""
 
 from __future__ import annotations
 
@@ -14,6 +14,14 @@ from .effects import Burst, Effect, FlyingBall, Splat, ease_in, ease_out
 from .particles import ParticleSystem
 from .protocol import GAME_MAX_PLAYERS, PeerInfo, RoomInfo, game_title
 from .season import HIT_REACTIONS, THROW_TAUNTS, WAVE_TEXT, Season
+from .snowpile import SnowPile
+
+# Невидимых снежинок в секунду на ширину 1440 точек при плотности 1 (baseFlakeRate в SnowWorld.swift)
+BASE_FLAKE_RATE = 80.0
+# Сколько снега приносит снежинка относительно Mac-версии: у нас куча растёт медленнее
+# (на маке её разгребает бригада; при 1.0 куча упирается в потолок минут за 20, при 0.4 — примерно за час)
+PILE_GROWTH = 0.4
+PILE_FADE_SECONDS = 1.5  # старая куча растворяется при смене сезона и «Убрать снег»
 
 
 class World:
@@ -32,6 +40,10 @@ class World:
         self.effects: list[Effect] = []
         self.particles: ParticleSystem | None = None
         self._fading_out: ParticleSystem | None = None
+        self.ground: SnowPile | None = None
+        self._old_ground: SnowPile | None = None
+        self._old_ground_opacity = 0.0
+        self._sky_carry = 0.0
         self.set_geometry(geometry, available)
         self._rebuild_particles()
 
@@ -45,6 +57,10 @@ class World:
         self.ground_y = float(bottom - geometry.top())
         if self.particles:
             self.particles.set_ground(self.width, self.ground_y)
+        if self.ground is None:
+            self.ground = self._new_pile()
+        else:
+            self.ground.resize(self.width, self.ground_y)
         for avatar in self.avatars.values():
             avatar.ground_y = self.ground_y
 
@@ -72,6 +88,8 @@ class World:
         self.season = season
         self.density = density
         self.effects_enabled = effects_enabled
+        if season_changed and self.ground is not None:
+            self._fade_out_ground()  # старая куча растворяется, новая растёт с нуля
         if rebuild:
             # Плавная смена: старые осадки тают, новые проявляются
             self._fading_out = self.particles if season_changed else None
@@ -198,9 +216,52 @@ class World:
         self.effects.append(FlyingBall(art.ball(self.season.kind), start, point, control, 0.5, 3.0, 0.8, 30,
                                        ease_out, hit))
 
+    # MARK: - Снег на земле
+
+    def ground_surface(self, x: float) -> float:
+        """Куда ставить ступни: на снег, чуть провалившись (как groundSurface в Mac-версии)."""
+        return self.ground_y - self.ground.height(x) * 0.8 if self.ground else self.ground_y
+
+    def _accumulate(self, dt: float) -> None:
+        """С неба падают «невидимые» снежинки с той же частотой, что и видимые; каждая ложится на землю.
+        Крупные приносят больше снега (но не линейно, иначе экран быстро заполнится)."""
+        rate = BASE_FLAKE_RATE * self.density * self.width / 1440
+        self._sky_carry += rate * dt
+        count = min(int(self._sky_carry), 400)
+        self._sky_carry -= int(self._sky_carry)
+        factor = 0.32 * self.season.accumulation * PILE_GROWTH
+        ground = self.ground
+        width = self.width
+        for _ in range(count):
+            r = random.random()
+            ground.deposit(random.uniform(0, width), (2.2 + r * r * 5.5) * factor)
+
+    def _new_pile(self) -> SnowPile:
+        season = self.season
+        return SnowPile(self.width, self.ground_y, season.pile_fill, season.pile_stroke,
+                        season.pile_sprites, season.pile_under, self.pixel_ratio)
+
+    def _fade_out_ground(self) -> None:
+        if self.ground is not None and not self.ground.is_empty:
+            self._old_ground = self.ground
+            self._old_ground_opacity = 1.0
+        self.ground = self._new_pile()
+
+    def clear_snow(self) -> None:
+        self._fade_out_ground()
+
     # MARK: - Шаг и рисование
 
     def tick(self, dt: float) -> None:
+        if self.ground:
+            snowing = self.effects_enabled
+            if snowing:
+                self._accumulate(dt)
+            self.ground.tick(dt, melting=not snowing)
+        if self._old_ground is not None:
+            self._old_ground_opacity -= dt / PILE_FADE_SECONDS
+            if self._old_ground_opacity <= 0:
+                self._old_ground = None
         if self.particles:
             self.particles.tick(dt)
             if self.particles.opacity < 1:
@@ -212,6 +273,7 @@ class World:
                 self._fading_out = None
         for avatar in self.avatars.values():
             avatar.tick(dt, self.width)
+            avatar.ground_y = self.ground_surface(avatar.x)
         for effect in list(self.effects):
             effect.tick(dt)
         self.effects = [e for e in self.effects if e.alive]
@@ -224,6 +286,10 @@ class World:
                 self.particles.paint(painter)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.setRenderHint(QPainter.Antialiasing)
+        if self._old_ground:
+            self._old_ground.paint(painter, self._old_ground_opacity)
+        if self.ground:
+            self.ground.paint(painter)
         for avatar in self.avatars.values():
             avatar.paint(painter)
         for effect in self.effects:
@@ -234,4 +300,5 @@ class World:
     @property
     def is_idle(self) -> bool:
         """Нечего рисовать — можно не перерисовывать окно."""
-        return self.particles is None and self._fading_out is None and not self.avatars and not self.effects
+        return (self.particles is None and self._fading_out is None and not self.avatars and not self.effects
+                and (self.ground is None or self.ground.is_empty) and self._old_ground is None)
