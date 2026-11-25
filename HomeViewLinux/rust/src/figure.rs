@@ -11,19 +11,7 @@ use crate::gfx::{self, Affine, Image, SpriteBatch, Texture};
 use crate::particles::art_dir;
 use crate::text::Text;
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Hat { Beanie, Cap, Doppi, StrawHat }
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum Status { Active, Away, Busy }
-
-#[derive(Clone, Copy)]
-pub struct Style {
-    pub hat: Hat,
-    pub hat_color: u32,
-    pub vest_color: u32,
-    pub skin_color: u32,
-}
+use homeview::protocol::{AvatarStyle as Style, HatStyle as Hat, PeerInfo, PeerStatus as Status};
 
 /// Прямоугольник в точках, ось Y вверх: (x, y) — левый нижний угол.
 #[derive(Clone, Copy)]
@@ -78,6 +66,12 @@ pub struct Parts {
 }
 
 impl Parts {
+    unsafe fn delete(&self, gl: &glow::Context) {
+        for t in [self.leg, self.arm_back, self.arm_front, self.body] {
+            gl.delete_texture(t.id);
+        }
+    }
+
     pub unsafe fn build(gl: &glow::Context, art: &mut Art, style: Style) -> Parts {
         let hand = ("hv_person_hand", Some(style.skin_color));
         let hat: Vec<(&'static str, Option<u32>)> = match style.hat {
@@ -122,8 +116,9 @@ impl Clip {
 pub struct Label { texture: Texture }
 
 pub struct Peer {
-    pub name: String,
+    pub info: PeerInfo,
     pub status: Status,
+    style: Style,
     parts: Parts,
     pub x: f32,
     pub ground_y: f32,
@@ -149,19 +144,54 @@ unsafe fn label(gl: &glow::Context, img: &Image) -> Label {
 }
 
 impl Peer {
-    pub unsafe fn new(gl: &glow::Context, art: &mut Art, text: &mut Text, name: &str, team: &str, status: Status,
-                      style: Style, x: f32, scale: f32, text_scale: f32) -> Peer {
-        let mut tag = format!("{name} · {team}");
-        match status {
-            Status::Away => tag = format!("☕ {tag}"),
-            Status::Busy => tag = format!("🔕 {tag}"),
-            Status::Active => {}
-        }
-        let tag = label(gl, &text.pill(&tag, rgba(0x0F1B2D, 199), text_scale));
+    pub unsafe fn new(gl: &glow::Context, art: &mut Art, text: &mut Text, info: &PeerInfo,
+                      x: f32, scale: f32, text_scale: f32) -> Peer {
+        let tag = Self::make_tag(gl, text, info, text_scale);
         Peer {
-            name: name.into(), status, parts: Parts::build(gl, art, style), x, ground_y: 0.0, scale, text_scale,
+            info: info.clone(), status: info.status, style: info.avatar, parts: Parts::build(gl, art, info.avatar),
+            x, ground_y: 0.0, scale, text_scale,
             facing: 1.0, target_x: x, pause: 1.0 + fastrand::f32() * 3.0, walking: false, walk_time: 0.0,
             wave: None, hop: None, tag, bubble: None,
+        }
+    }
+
+    unsafe fn make_tag(gl: &glow::Context, text: &mut Text, info: &PeerInfo, text_scale: f32) -> Label {
+        let mut tag = info.name.clone();
+        if !info.team.is_empty() {
+            tag = format!("{tag} · {}", info.team);
+        }
+        match info.status {
+            Status::Away => tag = format!("☕ {tag}"),
+            Status::Busy => tag = format!("🔕 {tag}"),
+            _ => {}
+        }
+        label(gl, &text.pill(&tag, rgba(0x0F1B2D, 199), text_scale))
+    }
+
+    /// Коллега сменил имя, шапку или статус.
+    pub unsafe fn update_info(&mut self, gl: &glow::Context, art: &mut Art, text: &mut Text, info: &PeerInfo) {
+        if *info == self.info {
+            return;
+        }
+        if info.avatar != self.style {
+            self.parts.delete(gl);
+            self.parts = Parts::build(gl, art, info.avatar);
+            self.style = info.avatar;
+        }
+        if info.status == Status::Away && self.status != Status::Away {
+            self.walking = false;
+        }
+        gl.delete_texture(self.tag.texture.id);
+        self.tag = Self::make_tag(gl, text, info, self.text_scale);
+        self.status = info.status;
+        self.info = info.clone();
+    }
+
+    pub unsafe fn delete(&mut self, gl: &glow::Context) {
+        self.parts.delete(gl);
+        gl.delete_texture(self.tag.texture.id);
+        if let Some((b, _, _)) = self.bubble.take() {
+            gl.delete_texture(b.texture.id);
         }
     }
 

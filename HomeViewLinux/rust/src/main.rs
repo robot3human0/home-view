@@ -34,13 +34,21 @@ use x11rb::connection::Connection;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ClipOrdering, Rectangle};
 
-use figure::{Art, Hat, Peer, Status, Style};
+use std::sync::Arc;
+
+use homeview::office::{Office, OfficeEvent, WAVE_TEXT};
+use homeview::protocol::PeerInfo;
+use homeview::settings::Store;
+use winit::event_loop::EventLoopProxy;
+use x11rb::protocol::screensaver::ConnectionExt as _;
+
+use figure::{Art, Peer};
 use gfx::SpriteBatch;
 use particles::{GpuLayer, ParticleRenderer};
 use text::Text;
 
-const AVATAR_SCALE: f32 = 2.0; // настройки Python-версии по умолчанию
-const TEXT_SCALE: f32 = 2.5;
+const IDLE_CHECK: Duration = Duration::from_secs(15);
+const THROW_TAUNTS: [&str; 4] = ["Лови!", "Держи!", "На тебе!", "Привет!"];
 
 #[allow(dead_code)] // window держим живым
 struct Overlay {
@@ -89,6 +97,11 @@ struct App {
     batch: Option<SpriteBatch>,
     text: Option<Text>,
     x11: Option<x11rb::rust_connection::RustConnection>,
+    root: u32,
+    store: Store,
+    office: Office,
+    art: Art,
+    last_idle_check: Option<Instant>,
     stats: Stats,
     frame: Duration,
     next_frame: Instant,
@@ -97,7 +110,7 @@ struct App {
 
 fn attributes(pos: PhysicalPosition<i32>, size: PhysicalSize<u32>) -> WindowAttributes {
     Window::default_attributes()
-        .with_title("HomeView probe")
+        .with_title("HomeView")
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(false)
@@ -131,15 +144,6 @@ fn xid(window: &Window) -> u32 {
     }
 }
 
-fn demo_peers() -> Vec<(&'static str, &'static str, Status, Style)> {
-    vec![
-        ("Алишер", "Backend", Status::Active, Style { hat: Hat::Beanie, hat_color: 0xC62828, vest_color: 0xF57C00, skin_color: 0xE0AC69 }),
-        ("Nodira", "iOS", Status::Active, Style { hat: Hat::Cap, hat_color: 0x1E3A5F, vest_color: 0x43A047, skin_color: 0xF1C27D }),
-        ("Тимур", "QA", Status::Away, Style { hat: Hat::Doppi, hat_color: 0x1E3A5F, vest_color: 0x1E88E5, skin_color: 0xC68642 }),
-        ("Kamola", "Design", Status::Busy, Style { hat: Hat::StrawHat, hat_color: 0x8E24AA, vest_color: 0xD81B60, skin_color: 0xFFDBAC }),
-    ]
-}
-
 impl App {
     fn create(&mut self, event_loop: &ActiveEventLoop) {
         let template = ConfigTemplateBuilder::new().with_alpha_size(8).with_transparency(true);
@@ -148,7 +152,8 @@ impl App {
             .build(event_loop, template, pick_config)
             .expect("GLX недоступен");
         eprintln!("Конфиг: alpha={} samples={}", config.alpha_size(), config.num_samples());
-        let (conn, _) = x11rb::connect(None).expect("X11");
+        let (conn, screen) = x11rb::connect(None).expect("X11");
+        self.root = conn.setup().roots[screen].root;
         let shape_version = conn.shape_query_version().unwrap().reply().unwrap();
         eprintln!("XShape {}.{}", shape_version.major_version, shape_version.minor_version);
 
@@ -201,20 +206,9 @@ impl App {
             let renderer = self.particles.as_mut().unwrap();
             let layers = unsafe { renderer.prepare(&self.opts.season, w, h, self.opts.density) };
 
-            let mut peers = Vec::new();
+            let peers = Vec::new();
             if self.overlays.is_empty() {
-                let started = Instant::now();
-                let text = self.text.get_or_insert_with(Text::new);
-                let mut art = Art::new();
-                let list = demo_peers();
-                let n = list.len() as f32;
-                for (i, (pname, team, status, style)) in list.into_iter().enumerate() {
-                    let x = w * (i as f32 + 0.5) / n;
-                    let mut p = unsafe { Peer::new(&renderer.gl, &mut art, text, pname, team, status, style, x, AVATAR_SCALE, TEXT_SCALE) };
-                    p.ground_y = h;
-                    peers.push(p);
-                }
-                eprintln!("Человечки: {} шт., подготовка {:.0} мс", peers.len(), started.elapsed().as_secs_f32() * 1000.0);
+                self.text.get_or_insert_with(Text::new);
             }
             let id = xid(&window);
             eprintln!("Окно {name}: {}x{} +{}+{} xid=0x{id:x}", size.width, size.height, pos.x, pos.y);
@@ -225,6 +219,80 @@ impl App {
         self.context = context;
         self.x11 = Some(conn);
         self.update_input_regions();
+        let settings = self.store.settings.clone();
+        eprintln!("Офис: {} · {}, сервер {}", settings.display_name, settings.team,
+                  if settings.server_address.is_empty() { "ищем через mDNS" } else { settings.server_address.as_str() });
+        self.office.apply_settings(settings);
+        self.office_tick();
+    }
+
+    /// Сетевые события офиса → человечки и облачка; раз в 15 с — проверка бездействия.
+    fn office_tick(&mut self) {
+        let now = Instant::now();
+        if self.last_idle_check.is_none_or(|t| now - t >= IDLE_CHECK) {
+            self.last_idle_check = Some(now);
+            let idle = self.x11.as_ref().and_then(|c| c.screensaver_query_info(self.root).ok()?.reply().ok())
+                .map(|r| Duration::from_millis(r.ms_since_user_input as u64));
+            self.office.set_idle(idle);
+        }
+        self.office.poll();
+        let events = self.office.take_events();
+        if events.is_empty() {
+            return;
+        }
+        let (Some(renderer), Some(text)) = (&self.particles, &mut self.text) else { return };
+        let gl = &renderer.gl;
+        let Some(primary) = self.overlays.first_mut() else { return };
+        let find = |peers: &mut Vec<Peer>, id: &str| peers.iter().position(|p| p.info.id == id);
+        for e in events {
+            match e {
+                OfficeEvent::PeersChanged => {
+                    let wanted: Vec<PeerInfo> = self.office.visible_peers().into_iter().cloned().collect();
+                    primary.peers.retain_mut(|p| {
+                        let keep = wanted.iter().any(|w| w.id == p.info.id);
+                        if !keep {
+                            unsafe { p.delete(gl) };
+                        }
+                        keep
+                    });
+                    for info in &wanted {
+                        match find(&mut primary.peers, &info.id) {
+                            Some(i) => unsafe { primary.peers[i].update_info(gl, &mut self.art, text, info) },
+                            None => {
+                                // Новый коллега заходит из-за края экрана
+                                let x = if fastrand::bool() { -30.0 } else { primary.width + 30.0 };
+                                let s = &self.store.settings;
+                                let mut p = unsafe { Peer::new(gl, &mut self.art, text, info, x, s.avatar_scale, s.text_scale) };
+                                p.ground_y = primary.height;
+                                primary.peers.push(p);
+                            }
+                        }
+                    }
+                }
+                OfficeEvent::ConnectionChanged => eprintln!("Офис: {}", self.office.status_line()),
+                OfficeEvent::Toast(t) => eprintln!("УВЕДОМЛЕНИЕ {} {} — {}{}", t.icon, t.title, t.body,
+                    if t.actions.is_empty() { String::new() } else {
+                        format!(" [{}]", t.actions.iter().map(|a| a.label.as_str()).collect::<Vec<_>>().join(" | "))
+                    }),
+                OfficeEvent::DismissToast(_) => {}
+                OfficeEvent::PeerWaves(id) => if let Some(i) = find(&mut primary.peers, &id) {
+                    let p = &mut primary.peers[i];
+                    p.wave();
+                    unsafe { p.say(gl, text, WAVE_TEXT, 2.5) };
+                },
+                OfficeEvent::PeerSays { id, text: message } => if let Some(i) = find(&mut primary.peers, &id) {
+                    unsafe { primary.peers[i].say(gl, text, &message, 5.0) };
+                },
+                OfficeEvent::PeerHops(id) => if let Some(i) = find(&mut primary.peers, &id) {
+                    primary.peers[i].hop();
+                },
+                OfficeEvent::IncomingProjectile(id) => if let Some(i) = find(&mut primary.peers, &id) {
+                    // Полёт снаряда «в экран» — следующим шагом, пока только реплика
+                    let taunt = THROW_TAUNTS[fastrand::usize(..THROW_TAUNTS.len())];
+                    unsafe { primary.peers[i].say(gl, text, taunt, 2.0) };
+                },
+            }
+        }
     }
 
     /// Мышь ловим только над человечками; без человечков окно целиком «прозрачно» для кликов.
@@ -312,26 +380,20 @@ impl App {
     }
 
     fn mouse(&mut self, id: WindowId, button: MouseButton) {
-        let (Some(text), Some(renderer)) = (&mut self.text, &self.particles) else { return };
         let Some(o) = self.overlays.iter_mut().find(|o| o.window.id() == id) else { return };
         let (cx, cy) = o.cursor;
-        let Some(p) = o.peers.iter_mut().rev().find(|p| p.contains(cx, cy)) else {
+        let Some(p) = o.peers.iter().rev().find(|p| p.contains(cx, cy)) else {
             eprintln!("Клик мимо человечка в ({cx:.0}, {cy:.0}) — не должен был дойти до окна");
             return;
         };
-        eprintln!("Клик по «{}» ({button:?})", p.name);
-        unsafe {
-            match button {
-                MouseButton::Left => {
-                    p.wave();
-                    p.say(&renderer.gl, text, "👋 Привет! Как дела? Пойдём на чай ☕", 3.0);
-                }
-                _ => {
-                    p.hop();
-                    p.say(&renderer.gl, text, "Ой!", 1.5);
-                }
-            }
+        let peer_id = p.info.id.clone();
+        eprintln!("Клик по «{}» ({button:?})", p.info.name);
+        // Меню коллеги (снежок, сообщение…) — следующим шагом; пока ЛКМ — помахать, ПКМ — позвать на чай
+        match button {
+            MouseButton::Left => self.office.wave(&peer_id),
+            _ => self.office.tea(&peer_id),
         }
+        self.office_tick();
     }
 }
 
@@ -344,13 +406,18 @@ fn cpu_seconds() -> f32 {
     ticks / 100.0
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<()> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.overlays.is_empty() {
             self.create(event_loop);
             self.next_frame = Instant::now();
             self.last_tick = Instant::now();
         }
+    }
+
+    /// Сетевой поток будит цикл: разобрать события офиса сразу, не дожидаясь кадра.
+    fn user_event(&mut self, _: &ActiveEventLoop, _: ()) {
+        self.office_tick();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -372,7 +439,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.start.elapsed().as_secs_f32() >= self.opts.seconds {
+        if self.opts.seconds > 0.0 && self.start.elapsed().as_secs_f32() >= self.opts.seconds {
             let s = &self.stats;
             let (from, cpu0) = s.steady_from.unwrap_or((self.start, 0.0));
             let el = from.elapsed().as_secs_f32();
@@ -384,6 +451,7 @@ impl ApplicationHandler for App {
             return;
         }
         if Instant::now() >= self.next_frame {
+            self.office_tick();
             self.render();
             // Ограничитель: следующий кадр не раньше чем через 1/fps (vsync сверху выравнивает).
             self.next_frame = (self.next_frame + self.frame).max(Instant::now() + self.frame / 2);
@@ -393,14 +461,17 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    let mut opts = Options { small: false, seconds: 20.0, season: particles::season_for_today().into(), fps: 60.0, density: 0.7 };
+    let store = Store::load();
+    let st = store.settings.clone();
+    let season = if st.season == "auto" { particles::season_for_today().to_string() } else { st.season.clone() };
+    let mut opts = Options { small: false, seconds: 0.0, season, fps: st.fps as f32, density: st.density };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         let next = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
             "--small" => opts.small = true,
-            "--seconds" => { opts.seconds = next(i).parse().unwrap_or(20.0); i += 1; }
+            "--seconds" => { opts.seconds = next(i).parse().unwrap_or(0.0); i += 1; }
             "--season" => { opts.season = next(i); i += 1; }
             "--fps" => { opts.fps = next(i).parse().unwrap_or(60.0); i += 1; }
             "--density" => { opts.density = next(i).parse().unwrap_or(0.7); i += 1; }
@@ -408,13 +479,18 @@ fn main() {
         }
         i += 1;
     }
-    eprintln!("Сезон: {}, плотность {}, выход через {} с", opts.season, opts.density, opts.seconds);
+    eprintln!("Настройки: {}", homeview::settings::config_path().display());
+    eprintln!("Сезон: {}, плотность {}, {}", opts.season, opts.density,
+              if opts.seconds > 0.0 { format!("выход через {} с", opts.seconds) } else { "без ограничения времени".into() });
     let frame = Duration::from_secs_f32(1.0 / opts.fps);
     let now = Instant::now();
+    let event_loop = EventLoop::<()>::with_user_event().build().expect("event loop");
+    let proxy: EventLoopProxy<()> = event_loop.create_proxy();
+    let office = Office::new(st, Arc::new(move || { let _ = proxy.send_event(()); }));
     let mut app = App {
         opts, start: now, overlays: Vec::new(), context: None, particles: None, batch: None, text: None, x11: None,
+        root: 0, store, office, art: Art::new(), last_idle_check: None,
         stats: Stats::default(), frame, next_frame: now, last_tick: now,
     };
-    let event_loop = EventLoop::new().expect("event loop");
     event_loop.run_app(&mut app).expect("run");
 }
