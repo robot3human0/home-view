@@ -9,6 +9,7 @@
 
 mod effects;
 mod figure;
+mod ground;
 mod gfx;
 mod menu;
 mod particles;
@@ -49,6 +50,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use effects::{Effect, EffectArt, Landed};
 use figure::{Art, Peer};
+use ground::{GroundRenderer, Pile};
 use homeview::office::{ActionKind, Toast};
 use menu::{Command, Item, Menu};
 use toasts::{Click, Toasts};
@@ -87,6 +89,8 @@ struct Overlay {
     menu: Option<Menu>,
     menu_dirty: bool,
     effects: Vec<Effect>,
+    /// Снег (листья, лепестки) на земле этого монитора.
+    pile: Pile,
 }
 
 /// Нажали на человечка: ещё не ясно — клик (меню) или перетаскивание.
@@ -111,6 +115,8 @@ struct Options {
     season: String,
     fps: f32,
     density: f32,
+    /// Отладка: во сколько раз быстрее растёт куча на земле.
+    pile_speed: f32,
 }
 
 #[derive(Default)]
@@ -151,6 +157,7 @@ struct App {
     /// Уведомления — в углу основного монитора (overlays[0]).
     toasts: Toasts,
     effect_art: Option<EffectArt>,
+    ground: Option<GroundRenderer>,
     stats: Stats,
     frame: Duration,
     next_frame: Instant,
@@ -254,6 +261,7 @@ impl App {
                     eprintln!("GL: {} / {}", gl.get_parameter_string(glow::VERSION), gl.get_parameter_string(glow::RENDERER));
                     self.batch = Some(SpriteBatch::new(&gl));
                     self.effect_art = Some(EffectArt::new(&gl, &self.opts.season));
+                    self.ground = Some(GroundRenderer::new(&gl, &self.opts.season));
                     self.particles = Some(ParticleRenderer::new(gl));
                 }
             }
@@ -269,7 +277,8 @@ impl App {
             eprintln!("Окно {name}: {}x{} +{}+{} xid=0x{id:x}", size.width, size.height, pos.x, pos.y);
             self.overlays.push(Overlay { window, pos: (pos.x as f32, pos.y as f32), xid: id, surface, layers, width: w, height: h, peers,
                                          cursor: (-1.0, -1.0), hovering: false, input_rects: None,
-                                         menu: None, menu_dirty: false, effects: Vec::new() });
+                                         menu: None, menu_dirty: false, effects: Vec::new(),
+                                         pile: Pile::new(w, h) });
             context = Some(ctx);
         }
         self.context = context;
@@ -418,6 +427,9 @@ impl App {
         let toasts = &mut self.toasts;
         toasts.tick(dt);
         let effect_art = self.effect_art.as_ref();
+        let ground = &mut self.ground;
+        let (season, density, snowing) = (self.opts.season.as_str(), self.opts.density, self.store.settings.effects_enabled);
+        let pile_dt = dt * self.opts.pile_speed;
         let mut landed: Vec<(usize, Landed)> = Vec::new();
         for (index, overlay) in self.overlays.iter_mut().enumerate().rev() {
             ctx.make_current(&overlay.surface).unwrap();
@@ -425,10 +437,17 @@ impl App {
                 gl.viewport(0, 0, overlay.width as i32, overlay.height as i32);
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
-                renderer.draw(&overlay.layers, overlay.width, overlay.height, overlay.height, time);
+                if snowing {
+                    renderer.draw(&overlay.layers, overlay.width, overlay.height, overlay.height, time);
+                }
                 gl.bind_vertex_array(Some(renderer.vao));
+                overlay.pile.tick(pile_dt, season, density, snowing);
+                if let Some(g) = ground.as_mut() {
+                    g.draw(gl, &mut overlay.pile, overlay.width, overlay.height, 1.0);
+                }
                 batch.begin(gl, overlay.width, overlay.height);
                 for p in &mut overlay.peers {
+                    p.ground_y = overlay.pile.surface(p.x); // стоит на снегу, чуть провалившись
                     p.tick(dt, overlay.width);
                     p.draw(gl, batch, now);
                 }
@@ -844,7 +863,7 @@ fn main() {
     let st = store.settings.clone();
     let st_scale = st.toast_scale;
     let season = if st.season == "auto" { particles::season_for_today().to_string() } else { st.season.clone() };
-    let mut opts = Options { small: false, seconds: 0.0, season, fps: st.fps as f32, density: st.density };
+    let mut opts = Options { small: false, seconds: 0.0, season, fps: st.fps as f32, density: st.density, pile_speed: 1.0 };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -855,6 +874,7 @@ fn main() {
             "--season" => { opts.season = next(i); i += 1; }
             "--fps" => { opts.fps = next(i).parse().unwrap_or(60.0); i += 1; }
             "--density" => { opts.density = next(i).parse().unwrap_or(0.7); i += 1; }
+            "--pile-speed" => { opts.pile_speed = next(i).parse().unwrap_or(1.0); i += 1; }
             other => { eprintln!("неизвестный параметр {other}"); std::process::exit(2); }
         }
         i += 1;
@@ -872,7 +892,7 @@ fn main() {
     let toasts = Toasts::new(st_scale);
     let mut app = App {
         opts, start: now, overlays: Vec::new(), context: None, particles: None, batch: None, text: None, x11: None,
-        root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None, toasts, effect_art: None,
+        root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None, toasts, effect_art: None, ground: None,
         stats: Stats::default(), frame, next_frame: now, last_tick: now,
     };
     event_loop.run_app(&mut app).expect("run");

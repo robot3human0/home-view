@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Rust-клиент с mock-сервером и ботами — без настоящего офиса.
 #
-#   ./run-mock.sh [секунд] [ботов]     (по умолчанию — без ограничения, 4 бота; выход — Ctrl+C)
+#   ./run-mock.sh [секунд] [ботов] [параметры клиента…]
+#   (по умолчанию — без ограничения, 4 бота; выход — Ctrl+C), например:
+#   ./run-mock.sh 300 4 --season winter --pile-speed 20
 #
 # Настройки — временная копия твоих (~/.config/HomeView/HomeViewLinux.conf) с адресом mock и без
 # кода офиса: имя, шапка и ID те же, а настоящий файл не меняется.
@@ -10,6 +12,7 @@ HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 LINUX_DIR="$(cd "$HERE/.." && pwd)"
 SECONDS_LIMIT="${1:-0}"
 BOTS="${2:-4}"
+shift $(( $# < 2 ? $# : 2 ))
 PORT=47792
 PYTHON="$LINUX_DIR/.venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON=python3
@@ -29,4 +32,4 @@ sed -i "/^\[General\]/a serverAddress=127.0.0.1:$PORT" "$CFG/HomeView/HomeViewLi
 MOCK=$!
 sleep 1.5
 echo "mock: $BOTS бота на 127.0.0.1:$PORT (журнал: $CFG/mock.log)"
-XDG_CONFIG_HOME="$CFG" "$HERE/target/release/homeview" --seconds "$SECONDS_LIMIT"
+XDG_CONFIG_HOME="$CFG" "$HERE/target/release/homeview" --seconds "$SECONDS_LIMIT" "$@"
