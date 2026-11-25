@@ -1,14 +1,15 @@
-//! Проба Rust-стека для HomeView.
+//! HomeView — Linux-клиент на Rust.
 //!
-//! 1. Прозрачный оверлей на каждом мониторе (GLX с альфой), осадки целиком в шейдере.
-//! 2. Человечки из спрайтов HomeView/Art с перекраской, таблички (кириллица, эмодзи), облачка;
-//!    мышь ловится только над человечками (XShape input region), остальное — насквозь.
+//! Прозрачный оверлей на каждом мониторе (GLX с альфой), осадки целиком в шейдере, человечки коллег
+//! из сети (спрайты HomeView/Art с перекраской), таблички и облачка. Мышь ловится только над
+//! человечками и открытым меню (XShape input region), остальное — насквозь.
 //!
-//! Запуск: `cargo run --release -- [--small] [--seconds N] [--season winter|spring|summer|autumn] [--fps N]`
-//! ЛКМ по человечку — машет и здоровается, ПКМ — подпрыгивает.
+//! Запуск: `homeview [--small] [--seconds N] [--season winter|spring|summer|autumn] [--fps N] [--density X]`
+//! Клик по человечку — меню коллеги. С mock-сервером: `run-mock.sh`.
 
 mod figure;
 mod gfx;
+mod menu;
 mod particles;
 mod text;
 
@@ -42,17 +43,33 @@ use homeview::settings::Store;
 use winit::event_loop::EventLoopProxy;
 use x11rb::protocol::screensaver::ConnectionExt as _;
 
+use std::sync::mpsc::{self, Receiver, Sender};
+
 use figure::{Art, Peer};
+use menu::{Command, Item, Menu};
 use gfx::SpriteBatch;
 use particles::{GpuLayer, ParticleRenderer};
 use text::Text;
 
 const IDLE_CHECK: Duration = Duration::from_secs(15);
 const THROW_TAUNTS: [&str; 4] = ["Лови!", "Держи!", "На тебе!", "Привет!"];
+const HIT_REACTIONS: [&str; 4] = ["Ой!", "Эй!", "Ну, держись!", "Ай!"];
+
+/// (эмодзи, чем кидаемся) — как в season.py
+fn season_projectile(season: &str) -> (&'static str, &'static str) {
+    match season {
+        "spring" => ("🌸", "цветочный шарик"),
+        "summer" => ("☀️", "водяной шарик"),
+        "autumn" => ("🍂", "листяной шарик"),
+        _ => ("❄️", "снежок"),
+    }
+}
 
 #[allow(dead_code)] // window держим живым
 struct Overlay {
     window: Window,
+    /// Левый верхний угол монитора на общем экране X.
+    pos: (f32, f32),
     xid: u32,
     surface: Surface<WindowSurface>,
     layers: Vec<GpuLayer>,
@@ -62,7 +79,25 @@ struct Overlay {
     cursor: (f32, f32),
     hovering: bool,
     input_rects: Option<Vec<(i16, i16, u16, u16)>>,
+    menu: Option<Menu>,
+    menu_dirty: bool,
 }
+
+/// Нажали на человечка: ещё не ясно — клик (меню) или перетаскивание.
+struct Press {
+    /// Окно, в котором нажали: X шлёт ему все движения мыши, пока кнопка не отпущена.
+    overlay: usize,
+    /// Монитор, на котором человечек сейчас (его можно перетащить на другой).
+    peer_overlay: usize,
+    peer_id: String,
+    start: (f32, f32),
+    /// Курсор относительно ступней — чтобы фигура не прыгала под курсор.
+    grab: (f32, f32),
+    dragging: bool,
+}
+
+/// Сдвиг мыши, после которого нажатие считается перетаскиванием.
+const DRAG_THRESHOLD: f32 = 6.0;
 
 struct Options {
     small: bool,
@@ -102,6 +137,11 @@ struct App {
     office: Office,
     art: Art,
     last_idle_check: Option<Instant>,
+    proxy: EventLoopProxy<()>,
+    /// Текст из диалога «Написать…» (zenity в отдельном потоке): кому, что.
+    compose_tx: Sender<(Option<String>, String)>,
+    compose_rx: Receiver<(Option<String>, String)>,
+    press: Option<Press>,
     stats: Stats,
     frame: Duration,
     next_frame: Instant,
@@ -134,6 +174,11 @@ fn pick_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
             std::process::exit(3);
         }
     }
+}
+
+/// Человечек коллеги на любом из мониторов.
+fn find_peer<'a>(overlays: &'a mut [Overlay], id: &str) -> Option<&'a mut Peer> {
+    overlays.iter_mut().flat_map(|o| o.peers.iter_mut()).find(|p| p.info.id == id)
 }
 
 fn xid(window: &Window) -> u32 {
@@ -212,8 +257,9 @@ impl App {
             }
             let id = xid(&window);
             eprintln!("Окно {name}: {}x{} +{}+{} xid=0x{id:x}", size.width, size.height, pos.x, pos.y);
-            self.overlays.push(Overlay { window, xid: id, surface, layers, width: w, height: h, peers,
-                                         cursor: (-1.0, -1.0), hovering: false, input_rects: None });
+            self.overlays.push(Overlay { window, pos: (pos.x as f32, pos.y as f32), xid: id, surface, layers, width: w, height: h, peers,
+                                         cursor: (-1.0, -1.0), hovering: false, input_rects: None,
+                                         menu: None, menu_dirty: false });
             context = Some(ctx);
         }
         self.context = context;
@@ -235,6 +281,9 @@ impl App {
                 .map(|r| Duration::from_millis(r.ms_since_user_input as u64));
             self.office.set_idle(idle);
         }
+        while let Ok((to, message)) = self.compose_rx.try_recv() {
+            self.office.chat(to.as_deref(), &message);
+        }
         self.office.poll();
         let events = self.office.take_events();
         if events.is_empty() {
@@ -242,28 +291,35 @@ impl App {
         }
         let (Some(renderer), Some(text)) = (&self.particles, &mut self.text) else { return };
         let gl = &renderer.gl;
-        let Some(primary) = self.overlays.first_mut() else { return };
-        let find = |peers: &mut Vec<Peer>, id: &str| peers.iter().position(|p| p.info.id == id);
+        if self.overlays.is_empty() {
+            return;
+        }
+        let overlays = &mut self.overlays;
         for e in events {
             match e {
                 OfficeEvent::PeersChanged => {
                     let wanted: Vec<PeerInfo> = self.office.visible_peers().into_iter().cloned().collect();
-                    primary.peers.retain_mut(|p| {
-                        let keep = wanted.iter().any(|w| w.id == p.info.id);
-                        if !keep {
-                            unsafe { p.delete(gl) };
-                        }
-                        keep
-                    });
+                    // Человечек может жить на любом мониторе (его туда перетащили)
+                    for o in overlays.iter_mut() {
+                        o.peers.retain_mut(|p| {
+                            let keep = wanted.iter().any(|w| w.id == p.info.id);
+                            if !keep {
+                                unsafe { p.delete(gl) };
+                            }
+                            keep
+                        });
+                    }
                     for info in &wanted {
-                        match find(&mut primary.peers, &info.id) {
-                            Some(i) => unsafe { primary.peers[i].update_info(gl, &mut self.art, text, info) },
+                        match find_peer(overlays, &info.id) {
+                            Some(p) => unsafe { p.update_info(gl, &mut self.art, text, info) },
                             None => {
-                                // Новый коллега заходит из-за края экрана
-                                let x = if fastrand::bool() { -30.0 } else { primary.width + 30.0 };
+                                // Новый коллега появляется у края основного монитора и уходит внутрь
+                                let primary = &mut overlays[0];
+                                let x = if fastrand::bool() { 0.0 } else { primary.width };
                                 let s = &self.store.settings;
                                 let mut p = unsafe { Peer::new(gl, &mut self.art, text, info, x, s.avatar_scale, s.text_scale) };
                                 p.ground_y = primary.height;
+                                p.clamp_x(primary.width);
                                 primary.peers.push(p);
                             }
                         }
@@ -275,21 +331,20 @@ impl App {
                         format!(" [{}]", t.actions.iter().map(|a| a.label.as_str()).collect::<Vec<_>>().join(" | "))
                     }),
                 OfficeEvent::DismissToast(_) => {}
-                OfficeEvent::PeerWaves(id) => if let Some(i) = find(&mut primary.peers, &id) {
-                    let p = &mut primary.peers[i];
+                OfficeEvent::PeerWaves(id) => if let Some(p) = find_peer(overlays, &id) {
                     p.wave();
                     unsafe { p.say(gl, text, WAVE_TEXT, 2.5) };
                 },
-                OfficeEvent::PeerSays { id, text: message } => if let Some(i) = find(&mut primary.peers, &id) {
-                    unsafe { primary.peers[i].say(gl, text, &message, 5.0) };
+                OfficeEvent::PeerSays { id, text: message } => if let Some(p) = find_peer(overlays, &id) {
+                    unsafe { p.say(gl, text, &message, 5.0) };
                 },
-                OfficeEvent::PeerHops(id) => if let Some(i) = find(&mut primary.peers, &id) {
-                    primary.peers[i].hop();
+                OfficeEvent::PeerHops(id) => if let Some(p) = find_peer(overlays, &id) {
+                    p.hop();
                 },
-                OfficeEvent::IncomingProjectile(id) => if let Some(i) = find(&mut primary.peers, &id) {
+                OfficeEvent::IncomingProjectile(id) => if let Some(p) = find_peer(overlays, &id) {
                     // Полёт снаряда «в экран» — следующим шагом, пока только реплика
                     let taunt = THROW_TAUNTS[fastrand::usize(..THROW_TAUNTS.len())];
-                    unsafe { primary.peers[i].say(gl, text, taunt, 2.0) };
+                    unsafe { p.say(gl, text, taunt, 2.0) };
                 },
             }
         }
@@ -299,9 +354,14 @@ impl App {
     fn update_input_regions(&mut self) {
         let Some(conn) = &self.x11 else { return };
         for o in &mut self.overlays {
-            let rects: Vec<Rectangle> = o.peers.iter().flat_map(|p| p.hit_rects()).map(|(x, y, w, h)| {
-                Rectangle { x: x.floor() as i16, y: y.floor() as i16, width: w.ceil() as u16, height: h.ceil() as u16 }
-            }).collect();
+            // Открыто меню — ловим клики по всему окну: клик мимо меню просто закрывает его
+            let rects: Vec<Rectangle> = if o.menu.is_some() {
+                vec![Rectangle { x: 0, y: 0, width: o.width as u16, height: o.height as u16 }]
+            } else {
+                o.peers.iter().flat_map(|p| p.hit_rects()).map(|(x, y, w, h)| {
+                    Rectangle { x: x.floor() as i16, y: y.floor() as i16, width: w.ceil() as u16, height: h.ceil() as u16 }
+                }).collect()
+            };
             let key: Vec<_> = rects.iter().map(|r| (r.x, r.y, r.width, r.height)).collect();
             if o.input_rects.as_ref() != Some(&key) {
                 conn.shape_rectangles(shape::SO::SET, shape::SK::INPUT, ClipOrdering::UNSORTED, o.xid, 0, 0, &rects).unwrap();
@@ -313,7 +373,8 @@ impl App {
     }
 
     fn render(&mut self) {
-        let (Some(ctx), Some(renderer), Some(batch)) = (&self.context, &self.particles, &mut self.batch) else { return };
+        let (Some(ctx), Some(renderer), Some(batch), Some(text)) = (&self.context, &self.particles, &mut self.batch, &mut self.text)
+            else { return };
         let gl = &renderer.gl;
         let now = Instant::now();
         let dt = (now - self.last_tick).as_secs_f32().min(0.1);
@@ -333,6 +394,12 @@ impl App {
                 for p in &mut overlay.peers {
                     p.tick(dt, overlay.width);
                     p.draw(gl, batch, now);
+                }
+                if let Some(menu) = &mut overlay.menu {
+                    let tex = menu.texture(gl, text, overlay.menu_dirty);
+                    overlay.menu_dirty = false;
+                    batch.quad(gl, tex, &gfx::Affine::IDENTITY, menu.x, menu.y, tex.width as f32, tex.height as f32,
+                               [1.0, 1.0, 1.0], 1.0);
                 }
                 batch.end(gl);
             }
@@ -379,21 +446,190 @@ impl App {
         }
     }
 
-    fn mouse(&mut self, id: WindowId, button: MouseButton) {
-        let Some(o) = self.overlays.iter_mut().find(|o| o.window.id() == id) else { return };
-        let (cx, cy) = o.cursor;
-        let Some(p) = o.peers.iter().rev().find(|p| p.contains(cx, cy)) else {
+    fn mouse_press(&mut self, id: WindowId) {
+        let Some(index) = self.overlays.iter().position(|o| o.window.id() == id) else { return };
+        let (cx, cy) = self.overlays[index].cursor;
+        // Открытое меню: пункт — выполнить, мимо — просто закрыть
+        if self.overlays[index].menu.is_some() {
+            let command = self.overlays[index].menu.as_ref().and_then(|m| m.command_at(cx, cy));
+            self.close_menu(index);
+            if let Some(c) = command {
+                self.run(c);
+            }
+            return;
+        }
+        let Some(p) = self.overlays[index].peers.iter().rev().find(|p| p.contains(cx, cy)) else {
             eprintln!("Клик мимо человечка в ({cx:.0}, {cy:.0}) — не должен был дойти до окна");
             return;
         };
-        let peer_id = p.info.id.clone();
-        eprintln!("Клик по «{}» ({button:?})", p.info.name);
-        // Меню коллеги (снежок, сообщение…) — следующим шагом; пока ЛКМ — помахать, ПКМ — позвать на чай
-        match button {
-            MouseButton::Left => self.office.wave(&peer_id),
-            _ => self.office.tea(&peer_id),
+        let (fx, fy) = p.feet();
+        self.press = Some(Press { overlay: index, peer_overlay: index, peer_id: p.info.id.clone(), start: (cx, cy), grab: (cx - fx, cy - fy),
+                                  dragging: false });
+    }
+
+    /// Пока кнопка нажата, X присылает движение мыши этому окну, даже вне области кликов
+    /// и даже над другим монитором (координаты — относительно этого окна).
+    fn mouse_drag(&mut self, index: usize) {
+        let Some(press) = &mut self.press else { return };
+        if press.overlay != index {
+            return;
+        }
+        let (lx, ly) = self.overlays[index].cursor;
+        if !press.dragging {
+            if (lx - press.start.0).hypot(ly - press.start.1) < DRAG_THRESHOLD {
+                return;
+            }
+            press.dragging = true;
+            let o = &mut self.overlays[press.peer_overlay];
+            if let Some(p) = o.peers.iter_mut().find(|p| p.info.id == press.peer_id) {
+                p.start_drag();
+            }
+            self.overlays[index].window.set_cursor(CursorIcon::Grabbing);
+        }
+        // Где курсор на общем экране и над каким он монитором
+        let origin = self.overlays[index].pos;
+        let (gx, gy) = (origin.0 + lx, origin.1 + ly);
+        let target = self.overlays.iter()
+            .position(|o| gx >= o.pos.0 && gx < o.pos.0 + o.width && gy >= o.pos.1 && gy < o.pos.1 + o.height)
+            .unwrap_or(press.peer_overlay);
+        if target != press.peer_overlay {
+            // Переезд на другой монитор: тот же человечек (текстуры общие — один GL-контекст)
+            let from = &mut self.overlays[press.peer_overlay].peers;
+            if let Some(i) = from.iter().position(|p| p.info.id == press.peer_id) {
+                let mut p = from.remove(i);
+                p.ground_y = self.overlays[target].height;
+                self.overlays[target].peers.push(p);
+                press.peer_overlay = target;
+            }
+        }
+        let o = &mut self.overlays[press.peer_overlay];
+        let (x, y) = (gx - o.pos.0, gy - o.pos.1);
+        if let Some(p) = o.peers.iter_mut().find(|p| p.info.id == press.peer_id) {
+            p.drag_to(x - press.grab.0, y - press.grab.1, o.width);
+        }
+    }
+
+    fn mouse_release(&mut self, id: WindowId) {
+        let Some(press) = self.press.take() else { return };
+        let Some(index) = self.overlays.iter().position(|o| o.window.id() == id) else { return };
+        if press.overlay != index {
+            return;
+        }
+        if press.dragging {
+            if let Some(p) = self.overlays[press.peer_overlay].peers.iter_mut().find(|p| p.info.id == press.peer_id) {
+                p.drop_down();
+            }
+            let o = &mut self.overlays[index];
+            o.hovering = false;
+            o.window.set_cursor(CursorIcon::Default);
+            return;
+        }
+        // Клик без перетаскивания — меню коллеги
+        let o = &self.overlays[index];
+        let (cx, cy) = o.cursor;
+        let items = self.peer_menu(&press.peer_id);
+        let (Some(text), w, h) = (&mut self.text, o.width, o.height) else { return };
+        let menu = Menu::new(text, items, (cx, cy), (w, h), self.store.settings.toast_scale);
+        let o = &mut self.overlays[index];
+        o.menu = Some(menu);
+        o.menu_dirty = true;
+        o.window.set_cursor(CursorIcon::Default);
+        self.update_input_regions();
+    }
+
+    fn close_menu(&mut self, index: usize) {
+        let gl = self.particles.as_ref().map(|r| &r.gl);
+        let o = &mut self.overlays[index];
+        if let (Some(mut m), Some(gl)) = (o.menu.take(), gl) {
+            unsafe { m.delete(gl) };
+        }
+        o.hovering = false;
+        self.update_input_regions();
+    }
+
+    /// Меню коллеги — как fill_peer_menu в office.py.
+    fn peer_menu(&self, id: &str) -> Vec<Item> {
+        let Some(info) = self.office.peers.get(id) else { return vec![Item::Info("Коллега ушёл".into())] };
+        let mut items = vec![
+            Item::Info(if info.team.is_empty() { info.name.clone() } else { format!("{} · {}", info.name, info.team) }),
+            Item::Info(homeview::office::status_title(info.status).into()),
+            Item::Separator,
+        ];
+        if let Some(room) = self.office.rooms.values()
+            .find(|r| r.host_id == id && r.phase == homeview::protocol::RoomPhase::Lobby) {
+            let (emoji, title) = room.game.title();
+            items.push(Item::Info(format!("{emoji} Лобби «{title}» — игры пока только на Mac")));
+            items.push(Item::Separator);
+        }
+        let (emoji, projectile) = season_projectile(&self.opts.season);
+        items.extend([
+            Item::Action("👋  Помахать".into(), Command::Wave(id.into())),
+            Item::Action(format!("{emoji}  Кинуть {projectile}"), Command::Throw(id.into())),
+            Item::Action("💬  Написать…".into(), Command::Compose(Some(id.into()))),
+            Item::Action("☕  Позвать на чай".into(), Command::Tea(id.into())),
+            Item::Separator,
+        ]);
+        if self.store.settings.hidden_peers.contains(id) {
+            items.push(Item::Action("👀  Показывать на экране".into(), Command::Show(id.into())));
+        } else {
+            items.push(Item::Action("🙈  Убрать с моего экрана".into(), Command::Hide(id.into())));
+        }
+        items
+    }
+
+    fn run(&mut self, command: Command) {
+        match command {
+            Command::Wave(id) => self.office.wave(&id),
+            Command::Tea(id) => self.office.tea(&id),
+            Command::Throw(id) => {
+                if self.office.can_throw() {
+                    // Полёт снаряда — следующим шагом; пока сразу «попадание»
+                    self.office.projectile_hit(&id);
+                    let (Some(renderer), Some(text)) = (&self.particles, &mut self.text) else { return };
+                    if let Some(p) = find_peer(&mut self.overlays, &id) {
+                        p.hop();
+                        let reaction = HIT_REACTIONS[fastrand::usize(..HIT_REACTIONS.len())];
+                        unsafe { p.say(&renderer.gl, text, reaction, 2.0) };
+                    }
+                }
+            }
+            Command::Compose(to) => self.compose(to),
+            Command::Hide(id) | Command::Show(id) => {
+                let mut s = self.store.settings.clone();
+                if !s.hidden_peers.remove(&id) {
+                    s.hidden_peers.insert(id);
+                }
+                self.store.save(s.clone());
+                self.office.apply_settings(s);
+            }
         }
         self.office_tick();
+    }
+
+    /// Диалог GNOME (zenity) в отдельном потоке — главный цикл и анимация не ждут.
+    fn compose(&self, to: Option<String>) {
+        let title = match &to {
+            Some(id) => format!("Сообщение для {}", self.office.name(id)),
+            None => "Сообщение всем в офисе".into(),
+        };
+        let tx = self.compose_tx.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new("zenity")
+                .args(["--entry", "--title", &title, "--text", "Текст (до 200 символов):", "--width", "460"])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    let message = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !message.is_empty() {
+                        let _ = tx.send((to, message));
+                        let _ = proxy.send_event(());
+                    }
+                }
+                Ok(_) => {} // «Отмена»
+                Err(e) => eprintln!("zenity не запустился: {e}"),
+            }
+        });
     }
 }
 
@@ -424,8 +660,24 @@ impl ApplicationHandler<()> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(o) = self.overlays.iter_mut().find(|o| o.window.id() == id) {
-                    o.cursor = (position.x as f32, position.y as f32);
+                if let Some(index) = self.overlays.iter().position(|o| o.window.id() == id) {
+                    self.overlays[index].cursor = (position.x as f32, position.y as f32);
+                    if self.press.is_some() {
+                        self.mouse_drag(index);
+                        return;
+                    }
+                    let o = &mut self.overlays[index];
+                    if let Some(menu) = &mut o.menu {
+                        if menu.hover(o.cursor.0, o.cursor.1) {
+                            o.menu_dirty = true;
+                        }
+                        let over = menu.command_at(o.cursor.0, o.cursor.1).is_some();
+                        if over != o.hovering {
+                            o.hovering = over;
+                            o.window.set_cursor(if over { CursorIcon::Pointer } else { CursorIcon::Default });
+                        }
+                        return;
+                    }
                     let over = o.peers.iter().any(|p| p.contains(o.cursor.0, o.cursor.1));
                     if over != o.hovering {
                         o.hovering = over;
@@ -433,7 +685,10 @@ impl ApplicationHandler<()> for App {
                     }
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => self.mouse(id, button),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left | MouseButton::Right, .. } => {
+                self.mouse_press(id)
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, .. } => self.mouse_release(id),
             _ => {}
         }
     }
@@ -486,10 +741,12 @@ fn main() {
     let now = Instant::now();
     let event_loop = EventLoop::<()>::with_user_event().build().expect("event loop");
     let proxy: EventLoopProxy<()> = event_loop.create_proxy();
-    let office = Office::new(st, Arc::new(move || { let _ = proxy.send_event(()); }));
+    let waker = proxy.clone();
+    let office = Office::new(st, Arc::new(move || { let _ = waker.send_event(()); }));
+    let (compose_tx, compose_rx) = mpsc::channel();
     let mut app = App {
         opts, start: now, overlays: Vec::new(), context: None, particles: None, batch: None, text: None, x11: None,
-        root: 0, store, office, art: Art::new(), last_idle_check: None,
+        root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None,
         stats: Stats::default(), frame, next_frame: now, last_tick: now,
     };
     event_loop.run_app(&mut app).expect("run");

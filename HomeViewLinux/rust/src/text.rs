@@ -14,6 +14,7 @@ pub struct Text {
     fonts: FontSystem,
     cache: SwashCache,
     family: String,
+    emoji_family: String,
 }
 
 impl Text {
@@ -25,17 +26,24 @@ impl Text {
             .ok().and_then(|o| String::from_utf8(o.stdout).ok()).filter(|s| !s.is_empty())
             .unwrap_or_else(|| "DejaVu Sans".into());
         fonts.db_mut().set_sans_serif_family(family.clone());
-        eprintln!("Шрифты: {} начертаний, sans-serif = {family}, загрузка {:.0} мс",
+        let emoji_family = std::process::Command::new("fc-match").args(["-f", "%{family[0]}", "emoji"]).output()
+            .ok().and_then(|o| String::from_utf8(o.stdout).ok()).filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Noto Color Emoji".into());
+        eprintln!("Шрифты: {} начертаний, sans-serif = {family}, эмодзи = {emoji_family}, загрузка {:.0} мс",
                   fonts.db().faces().count(), started.elapsed().as_secs_f32() * 1000.0);
-        Text { fonts, cache: SwashCache::new(), family }
+        Text { fonts, cache: SwashCache::new(), family, emoji_family }
     }
 
     fn layout(&mut self, text: &str, px: f32, weight: Weight, wrap: Option<f32>) -> (Buffer, f32, f32) {
+        let text = &emoji_presentation(text);
         let metrics = Metrics::new(px, (px * 1.2).ceil());
         let mut buffer = Buffer::new(&mut self.fonts, metrics);
         buffer.set_size(&mut self.fonts, wrap, None);
         let attrs = Attrs::new().family(Family::Name(&self.family)).weight(weight);
-        buffer.set_text(&mut self.fonts, text, attrs, Shaping::Advanced);
+        // Эмодзи — явно шрифтом эмодзи: иначе ☕ ❄ ☀ берутся из обычного шрифта (мелкие и одноцветные)
+        let emoji = Attrs::new().family(Family::Name(&self.emoji_family)).weight(weight);
+        let spans = split_emoji(text).into_iter().map(|(t, e)| (t, if e { emoji } else { attrs }));
+        buffer.set_rich_text(&mut self.fonts, spans, attrs, Shaping::Advanced);
         if wrap.is_some() {
             for line in buffer.lines.iter_mut() {
                 line.set_align(Some(Align::Center));
@@ -63,6 +71,18 @@ impl Text {
                 pixmap.fill_rect(rect, &paint, Transform::identity(), None);
             }
         });
+    }
+
+    /// Ширина и высота строки (без переноса).
+    pub fn measure_line(&mut self, text: &str, px: f32, weight: Weight) -> (f32, f32) {
+        let (_, w, h) = self.layout(text, px, weight, None);
+        (w, h)
+    }
+
+    /// Нарисовать строку в картинку: (x, y) — левый верхний угол строки.
+    pub fn draw_line(&mut self, pixmap: &mut Pixmap, text: &str, px: f32, weight: Weight, x: f32, y: f32, color: Color) {
+        let (mut buffer, _, _) = self.layout(text, px, weight, None);
+        self.draw_text(pixmap, &mut buffer, x.round(), y.round(), color);
     }
 
     /// Табличка-«пилюля» «Имя · Команда».
@@ -105,12 +125,53 @@ impl Text {
     }
 }
 
-fn to_image(pixmap: Pixmap) -> Image {
+fn is_emoji(c: char) -> bool {
+    matches!(c, '\u{1F000}'..='\u{1FAFF}' | '\u{2600}'..='\u{27BF}' | '\u{2B00}'..='\u{2BFF}' | '\u{FE0F}' | '\u{200D}'
+             | '\u{2190}'..='\u{21FF}' | 'ℹ' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Текст → куски (кусок, это эмодзи?).
+fn split_emoji(text: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut current: Option<bool> = None;
+    for (i, c) in text.char_indices() {
+        let e = is_emoji(c);
+        if current.is_some_and(|k| k != e) {
+            out.push((&text[start..i], current.unwrap()));
+            start = i;
+        }
+        current = Some(e);
+    }
+    if let Some(k) = current {
+        out.push((&text[start..], k));
+    }
+    out
+}
+
+/// Символы, которые шрифты по умолчанию рисуют как текст (мелко, одним цветом), — просим цветной эмодзи (U+FE0F).
+fn emoji_presentation(text: &str) -> std::borrow::Cow<'_, str> {
+    const TEXT_DEFAULT: [char; 6] = ['☕', '☀', '❄', '♟', '⚠', 'ℹ'];
+    if !text.chars().any(|c| TEXT_DEFAULT.contains(&c)) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if TEXT_DEFAULT.contains(&c) && chars.peek() != Some(&'\u{FE0F}') {
+            out.push('\u{FE0F}');
+        }
+    }
+    out.into()
+}
+
+pub fn to_image(pixmap: Pixmap) -> Image {
     Image { width: pixmap.width(), height: pixmap.height(), data: pixmap.take() }
 }
 
 /// Скруглённый прямоугольник; `tail` = (полуширина, длина) — хвостик посередине нижней стороны.
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32, tail: Option<(f32, f32)>) -> tiny_skia::Path {
+pub fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32, tail: Option<(f32, f32)>) -> tiny_skia::Path {
     let r = r.min(w / 2.0).min(h / 2.0);
     let k = 0.552_284_8 * r;
     let (x1, y1) = (x + w, y + h);

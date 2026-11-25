@@ -133,6 +133,13 @@ pub struct Peer {
     hop: Option<Clip>,
     tag: Label,
     bubble: Option<(Label, Instant, Instant)>,
+    /// Высота ступней над землёй (тащат мышью или падает после этого).
+    air: f32,
+    fall_speed: f32,
+    dragged: bool,
+    drag_time: f32,
+    /// Ширина окна — чтобы облачко не вылезало за край.
+    screen_w: f32,
 }
 
 pub fn rgba(hex: u32, alpha: u8) -> [u8; 4] {
@@ -151,7 +158,8 @@ impl Peer {
             info: info.clone(), status: info.status, style: info.avatar, parts: Parts::build(gl, art, info.avatar),
             x, ground_y: 0.0, scale, text_scale,
             facing: 1.0, target_x: x, pause: 1.0 + fastrand::f32() * 3.0, walking: false, walk_time: 0.0,
-            wave: None, hop: None, tag, bubble: None,
+            wave: None, hop: None, tag, bubble: None, air: 0.0, fall_speed: 0.0, dragged: false, drag_time: 0.0,
+            screen_w: f32::MAX,
         }
     }
 
@@ -196,8 +204,55 @@ impl Peer {
     }
 
     fn top_y(&self) -> f32 {
-        self.ground_y - FIGURE_HEIGHT * self.scale
+        self.ground_y - self.air - FIGURE_HEIGHT * self.scale
     }
+
+    /// Ступни (экранные координаты).
+    pub fn feet(&self) -> (f32, f32) {
+        (self.x, self.ground_y - self.air)
+    }
+
+    /// Насколько центр может подойти к краю экрана: фигура видна целиком
+    /// (табличка и облачко у края сами сдвигаются внутрь — см. label_x).
+    fn margin(&self) -> f32 {
+        11.0 * self.scale + 4.0
+    }
+
+    /// Левый край надписи шириной `w` над человечком; у края экрана — сдвинута внутрь.
+    fn label_x(&self, w: f32) -> f32 {
+        (self.x - w / 2.0).min(self.screen_w - w - 2.0).max(2.0).round()
+    }
+
+    pub fn clamp_x(&mut self, width: f32) {
+        self.screen_w = width;
+        let m = self.margin().min(width / 2.0);
+        self.x = self.x.clamp(m, width - m);
+        self.target_x = self.target_x.clamp(m, width - m);
+    }
+
+    // MARK: - Перетаскивание мышью
+
+    pub fn start_drag(&mut self) {
+        self.dragged = true;
+        self.drag_time = 0.0;
+        self.walking = false;
+    }
+
+    /// Ступни — в точку (x, y) экрана; ниже земли не опускаем.
+    pub fn drag_to(&mut self, x: f32, feet_y: f32, width: f32) {
+        self.x = x;
+        self.air = (self.ground_y - feet_y).max(0.0);
+        self.clamp_x(width);
+    }
+
+    /// Отпустили: падает на землю и какое-то время стоит на новом месте.
+    pub fn drop_down(&mut self) {
+        self.dragged = false;
+        self.fall_speed = 0.0;
+        self.target_x = self.x;
+        self.pause = 4.0 + fastrand::f32() * 4.0;
+    }
+
 
     /// Где человечек ловит мышь (экранные координаты, Y вниз): отдельно фигура и табличка —
     /// одна общая рамка была бы шириной с табличку и ловила клики рядом с фигурой.
@@ -205,7 +260,7 @@ impl Peer {
         let s = self.scale;
         let figure = (self.x - 11.0 * s, self.top_y(), 22.0 * s, FIGURE_HEIGHT * s + 2.0);
         let (tw, th) = (self.tag.texture.width as f32, self.tag.texture.height as f32);
-        let tag = ((self.x - tw / 2.0).round(), (self.top_y() - 10.0 * self.text_scale - th / 2.0).round(), tw, th);
+        let tag = (self.label_x(tw), (self.top_y() - 10.0 * self.text_scale - th / 2.0).round(), tw, th);
         [figure, tag]
     }
 
@@ -234,11 +289,25 @@ impl Peer {
     }
 
     pub fn tick(&mut self, dt: f32, width: f32) {
+        self.clamp_x(width);
+        if self.dragged {
+            self.drag_time += dt;
+            return;
+        }
+        if self.air > 0.0 {
+            self.fall_speed += 2400.0 * dt;
+            self.air = (self.air - self.fall_speed * dt).max(0.0);
+            if self.air == 0.0 && self.fall_speed > 300.0 {
+                self.hop = Some(Clip { values: &[0.0, 5.0, 0.0], times: &[0.0, 0.5, 1.0], duration: 0.2, start: Instant::now() });
+            }
+            return;
+        }
         if self.status != Status::Away {
             if self.pause > 0.0 {
                 self.pause -= dt;
                 if self.pause <= 0.0 {
-                    self.target_x = (self.x + (fastrand::f32() * 640.0 - 320.0)).clamp(40.0, width - 40.0);
+                    let m = self.margin().min(width / 2.0);
+                    self.target_x = (self.x + (fastrand::f32() * 640.0 - 320.0)).clamp(m, width - m);
                     self.facing = if self.target_x >= self.x { 1.0 } else { -1.0 };
                     self.walking = true;
                 }
@@ -264,7 +333,11 @@ impl Peer {
         let s = self.scale;
         let busy = self.status == Status::Busy;
         let (mut leg_l, mut leg_r, mut arm_back, arm_front, mut dy, mut lift) = (0.0, 0.0, 0.0, 0.15, 0.0, 0.0);
-        if self.status == Status::Away {
+        if self.dragged || self.air > 0.0 {
+            // Висит в воздухе: болтает ногами, руки вверх
+            let swing = (self.drag_time * 7.0).sin();
+            (leg_l, leg_r, arm_back) = (0.35 * swing, -0.3 * swing, -2.5);
+        } else if self.status == Status::Away {
             (leg_l, leg_r, dy) = (1.35, 1.2, -8.0);
         } else if self.walking {
             let swing = (2.0 * PI * self.walk_time / 0.44).sin();
@@ -275,7 +348,7 @@ impl Peer {
         if let Some(v) = self.hop.as_ref().and_then(|c| c.value(now)) { lift += v } else { self.hop = None }
 
         let alpha = if busy { 0.55 } else { 1.0 };
-        let m = Affine::IDENTITY.translate(self.x, self.ground_y).scale(self.facing * s, -s).translate(0.0, lift + dy);
+        let m = Affine::IDENTITY.translate(self.x, self.ground_y - self.air).scale(self.facing * s, -s).translate(0.0, lift + dy);
         let white = [1.0, 1.0, 1.0];
         let part = |batch: &mut SpriteBatch, tex: Texture, at: (f32, f32), angle: f32, b: BoxPt| {
             let mm = m.translate(at.0, at.1).rotate(angle);
@@ -307,7 +380,7 @@ impl Peer {
 
     unsafe fn centered(&self, gl: &glow::Context, batch: &mut SpriteBatch, tex: Texture, center_y: f32, alpha: f32) {
         let (w, h) = (tex.width as f32, tex.height as f32);
-        let (x, y) = ((self.x - w / 2.0).round(), (center_y - h / 2.0).round());
+        let (x, y) = (self.label_x(w), (center_y - h / 2.0).round());
         batch.quad(gl, tex, &Affine::IDENTITY, x, y, w, h, [1.0, 1.0, 1.0], alpha);
     }
 }
