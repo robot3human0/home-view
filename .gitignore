@@ -19,3 +19,6 @@ build/
 
 # IDE
 .idea/
+
+# Rust (HomeViewLinux/rust)
+target/

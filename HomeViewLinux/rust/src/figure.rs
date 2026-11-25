@@ -1,0 +1,283 @@
+//! Человечек коллеги (порт avatar.py / art.person_parts): спрайты 8 px/pt, перекраска, походка,
+//! «Отошёл» сидит, «Занят» полупрозрачный, табличка с именем и облачко.
+
+use std::collections::HashMap;
+use std::f32::consts::PI;
+use std::time::Instant;
+
+use glow::HasContext;
+
+use crate::gfx::{self, Affine, Image, SpriteBatch, Texture};
+use crate::particles::art_dir;
+use crate::text::Text;
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Hat { Beanie, Cap, Doppi, StrawHat }
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Status { Active, Away, Busy }
+
+#[derive(Clone, Copy)]
+pub struct Style {
+    pub hat: Hat,
+    pub hat_color: u32,
+    pub vest_color: u32,
+    pub skin_color: u32,
+}
+
+/// Прямоугольник в точках, ось Y вверх: (x, y) — левый нижний угол.
+#[derive(Clone, Copy)]
+struct BoxPt { x: f32, y: f32, w: f32, h: f32 }
+
+const LEG_BOX: BoxPt = BoxPt { x: -2.6, y: -11.2, w: 6.4, h: 11.4 };
+const ARM_BOX: BoxPt = BoxPt { x: -2.4, y: -12.4, w: 4.8, h: 12.6 };
+const BODY_BOX: BoxPt = BoxPt { x: -9.8, y: 9.6, w: 20.6, h: 33.4 };
+const LEG_LEFT_AT: (f32, f32) = (-2.6, 11.0);
+const LEG_RIGHT_AT: (f32, f32) = (2.6, 11.0);
+const ARM_BACK_AT: (f32, f32) = (-4.0, 22.0);
+const ARM_FRONT_AT: (f32, f32) = (3.0, 22.0);
+const FIGURE_HEIGHT: f32 = 46.0;
+
+pub struct Art {
+    images: HashMap<&'static str, Image>,
+}
+
+impl Art {
+    pub fn new() -> Art {
+        Art { images: HashMap::new() }
+    }
+    fn image(&mut self, name: &'static str) -> &Image {
+        self.images.entry(name).or_insert_with(|| Image::load_png(&art_dir().join(format!("{name}.png"))))
+    }
+    fn composed(&mut self, layers: &[(&'static str, Option<u32>)]) -> Image {
+        let first = self.image(layers[0].0);
+        let mut out = Image::empty(first.width, first.height);
+        for &(name, tint) in layers {
+            let src = self.image(name).clone();
+            out.draw_over(&src, tint);
+        }
+        out
+    }
+}
+
+fn blend(a: u32, b: u32, t: f32) -> u32 {
+    let mut out = 0;
+    for shift in [16, 8, 0] {
+        let ca = ((a >> shift) & 0xFF) as f32;
+        let cb = ((b >> shift) & 0xFF) as f32;
+        out |= ((ca * (1.0 - t) + cb * t).round() as u32) << shift;
+    }
+    out
+}
+
+pub struct Parts {
+    leg: Texture,
+    arm_back: Texture,
+    arm_front: Texture,
+    body: Texture,
+}
+
+impl Parts {
+    pub unsafe fn build(gl: &glow::Context, art: &mut Art, style: Style) -> Parts {
+        let hand = ("hv_person_hand", Some(style.skin_color));
+        let hat: Vec<(&'static str, Option<u32>)> = match style.hat {
+            Hat::Beanie => vec![("hv_hat_beanie", Some(style.hat_color)), ("hv_hat_beanie_pom", None)],
+            Hat::Cap => vec![("hv_hat_cap", Some(style.hat_color))],
+            Hat::Doppi => vec![("hv_hat_doppi", None)],
+            Hat::StrawHat => vec![("hv_hat_straw", None), ("hv_hat_straw_band", Some(style.hat_color))],
+        };
+        let mut body = vec![("hv_person_torso", Some(style.vest_color)), ("hv_person_jacket", None),
+                            ("hv_person_head", Some(style.skin_color)), ("hv_person_face", None)];
+        body.extend(hat);
+        let up = |img: &Image| gfx::upload(gl, img.width, img.height, &img.data, true);
+        Parts {
+            leg: up(&art.composed(&[("hv_person_leg", None)])),
+            arm_back: up(&art.composed(&[("hv_person_sleeve", Some(blend(style.vest_color, 0, 0.15))), hand])),
+            arm_front: up(&art.composed(&[("hv_person_sleeve", Some(style.vest_color)), hand])),
+            body: up(&art.composed(&body)),
+        }
+    }
+}
+
+struct Clip { values: &'static [f32], times: &'static [f32], duration: f32, start: Instant }
+
+impl Clip {
+    fn value(&self, now: Instant) -> Option<f32> {
+        let t = (now - self.start).as_secs_f32() / self.duration;
+        if t >= 1.0 {
+            return None;
+        }
+        let (v, k) = (self.values, self.times);
+        for i in 1..k.len() {
+            if t <= k[i] {
+                let span = k[i] - k[i - 1];
+                let local = if span > 0.0 { (t - k[i - 1]) / span } else { 1.0 };
+                return Some(v[i - 1] + (v[i] - v[i - 1]) * local);
+            }
+        }
+        v.last().copied()
+    }
+}
+
+pub struct Label { texture: Texture }
+
+pub struct Peer {
+    pub name: String,
+    pub status: Status,
+    parts: Parts,
+    pub x: f32,
+    pub ground_y: f32,
+    scale: f32,
+    text_scale: f32,
+    facing: f32,
+    target_x: f32,
+    pause: f32,
+    walking: bool,
+    walk_time: f32,
+    wave: Option<Clip>,
+    hop: Option<Clip>,
+    tag: Label,
+    bubble: Option<(Label, Instant, Instant)>,
+}
+
+pub fn rgba(hex: u32, alpha: u8) -> [u8; 4] {
+    [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8, alpha]
+}
+
+unsafe fn label(gl: &glow::Context, img: &Image) -> Label {
+    Label { texture: gfx::upload(gl, img.width, img.height, &img.data, false) }
+}
+
+impl Peer {
+    pub unsafe fn new(gl: &glow::Context, art: &mut Art, text: &mut Text, name: &str, team: &str, status: Status,
+                      style: Style, x: f32, scale: f32, text_scale: f32) -> Peer {
+        let mut tag = format!("{name} · {team}");
+        match status {
+            Status::Away => tag = format!("☕ {tag}"),
+            Status::Busy => tag = format!("🔕 {tag}"),
+            Status::Active => {}
+        }
+        let tag = label(gl, &text.pill(&tag, rgba(0x0F1B2D, 199), text_scale));
+        Peer {
+            name: name.into(), status, parts: Parts::build(gl, art, style), x, ground_y: 0.0, scale, text_scale,
+            facing: 1.0, target_x: x, pause: 1.0 + fastrand::f32() * 3.0, walking: false, walk_time: 0.0,
+            wave: None, hop: None, tag, bubble: None,
+        }
+    }
+
+    fn top_y(&self) -> f32 {
+        self.ground_y - FIGURE_HEIGHT * self.scale
+    }
+
+    /// Где человечек ловит мышь (экранные координаты, Y вниз): отдельно фигура и табличка —
+    /// одна общая рамка была бы шириной с табличку и ловила клики рядом с фигурой.
+    pub fn hit_rects(&self) -> [(f32, f32, f32, f32); 2] {
+        let s = self.scale;
+        let figure = (self.x - 11.0 * s, self.top_y(), 22.0 * s, FIGURE_HEIGHT * s + 2.0);
+        let (tw, th) = (self.tag.texture.width as f32, self.tag.texture.height as f32);
+        let tag = ((self.x - tw / 2.0).round(), (self.top_y() - 10.0 * self.text_scale - th / 2.0).round(), tw, th);
+        [figure, tag]
+    }
+
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        self.hit_rects().iter().any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
+    }
+
+    pub fn wave(&mut self) {
+        if self.wave.is_none() {
+            self.wave = Some(Clip { values: &[-0.4, -2.7, -2.2, -2.7, -2.2, -0.4], times: &[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                                    duration: 1.0, start: Instant::now() });
+        }
+    }
+
+    pub fn hop(&mut self) {
+        self.hop = Some(Clip { values: &[0.0, 14.0, 0.0], times: &[0.0, 0.5, 1.0], duration: 0.34, start: Instant::now() });
+    }
+
+    pub unsafe fn say(&mut self, gl: &glow::Context, text: &mut Text, message: &str, seconds: f32) {
+        let now = Instant::now();
+        let img = text.bubble(message, self.text_scale);
+        if let Some((old, _, _)) = self.bubble.take() {
+            gl.delete_texture(old.texture.id);
+        }
+        self.bubble = Some((label(gl, &img), now, now + std::time::Duration::from_secs_f32(seconds)));
+    }
+
+    pub fn tick(&mut self, dt: f32, width: f32) {
+        if self.status != Status::Away {
+            if self.pause > 0.0 {
+                self.pause -= dt;
+                if self.pause <= 0.0 {
+                    self.target_x = (self.x + (fastrand::f32() * 640.0 - 320.0)).clamp(40.0, width - 40.0);
+                    self.facing = if self.target_x >= self.x { 1.0 } else { -1.0 };
+                    self.walking = true;
+                }
+            } else {
+                let dx = self.target_x - self.x;
+                let speed = if self.status == Status::Busy { 22.0 } else { 42.0 } * self.scale.sqrt();
+                let step = speed * dt;
+                if dx.abs() <= step {
+                    self.x = self.target_x;
+                    self.walking = false;
+                    self.pause = 2.5 + fastrand::f32() * 5.5;
+                } else {
+                    self.x += step * dx.signum();
+                }
+            }
+        }
+        if self.walking {
+            self.walk_time += dt;
+        }
+    }
+
+    pub unsafe fn draw(&mut self, gl: &glow::Context, batch: &mut SpriteBatch, now: Instant) {
+        let s = self.scale;
+        let busy = self.status == Status::Busy;
+        let (mut leg_l, mut leg_r, mut arm_back, arm_front, mut dy, mut lift) = (0.0, 0.0, 0.0, 0.15, 0.0, 0.0);
+        if self.status == Status::Away {
+            (leg_l, leg_r, dy) = (1.35, 1.2, -8.0);
+        } else if self.walking {
+            let swing = (2.0 * PI * self.walk_time / 0.44).sin();
+            (leg_l, leg_r, arm_back) = (0.45 * swing, -0.45 * swing, -0.35 * swing);
+            lift = 1.1 * (PI * self.walk_time / 0.44).sin().abs();
+        }
+        if let Some(v) = self.wave.as_ref().and_then(|c| c.value(now)) { arm_back = v } else { self.wave = None }
+        if let Some(v) = self.hop.as_ref().and_then(|c| c.value(now)) { lift += v } else { self.hop = None }
+
+        let alpha = if busy { 0.55 } else { 1.0 };
+        let m = Affine::IDENTITY.translate(self.x, self.ground_y).scale(self.facing * s, -s).translate(0.0, lift + dy);
+        let white = [1.0, 1.0, 1.0];
+        let part = |batch: &mut SpriteBatch, tex: Texture, at: (f32, f32), angle: f32, b: BoxPt| {
+            let mm = m.translate(at.0, at.1).rotate(angle);
+            batch.quad(gl, tex, &mm, b.x, b.y + b.h, b.w, -b.h, white, alpha);
+        };
+        part(batch, self.parts.leg, LEG_LEFT_AT, leg_l, LEG_BOX);
+        part(batch, self.parts.leg, LEG_RIGHT_AT, leg_r, LEG_BOX);
+        part(batch, self.parts.arm_back, ARM_BACK_AT, arm_back, ARM_BOX);
+        part(batch, self.parts.body, (0.0, 0.0), 0.0, BODY_BOX);
+        part(batch, self.parts.arm_front, ARM_FRONT_AT, arm_front, ARM_BOX);
+
+        // Подписи — в экранных пикселях, по целым координатам (чёткий текст)
+        let k = self.text_scale;
+        let top = self.top_y();
+        let tag = self.tag.texture;
+        self.centered(gl, batch, tag, top - 10.0 * k, if busy { 0.7 } else { 1.0 });
+        if let Some((b, born, until)) = &self.bubble {
+            if now >= *until {
+                gl.delete_texture(b.texture.id);
+                self.bubble = None;
+            } else {
+                let fade = ((now - *born).as_secs_f32() / 0.15).min((*until - now).as_secs_f32() / 0.3).min(1.0);
+                let tex = b.texture;
+                let y = top - 30.0 * k - tex.height as f32 / 2.0 + 8.0 * k;
+                self.centered(gl, batch, tex, y, fade.max(0.0));
+            }
+        }
+    }
+
+    unsafe fn centered(&self, gl: &glow::Context, batch: &mut SpriteBatch, tex: Texture, center_y: f32, alpha: f32) {
+        let (w, h) = (tex.width as f32, tex.height as f32);
+        let (x, y) = ((self.x - w / 2.0).round(), (center_y - h / 2.0).round());
+        batch.quad(gl, tex, &Affine::IDENTITY, x, y, w, h, [1.0, 1.0, 1.0], alpha);
+    }
+}
