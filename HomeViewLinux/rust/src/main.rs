@@ -7,6 +7,7 @@
 //! Запуск: `homeview [--small] [--seconds N] [--season winter|spring|summer|autumn] [--fps N] [--density X]`
 //! Клик по человечку — меню коллеги. С mock-сервером: `run-mock.sh`.
 
+mod effects;
 mod figure;
 mod gfx;
 mod menu;
@@ -34,7 +35,7 @@ use winit::platform::x11::{WindowAttributesExtX11, WindowType};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId, WindowLevel};
 use x11rb::connection::Connection;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{ClipOrdering, Rectangle};
+use x11rb::protocol::xproto::{ClipOrdering, ConnectionExt as _, Rectangle};
 
 use std::sync::Arc;
 
@@ -46,6 +47,7 @@ use x11rb::protocol::screensaver::ConnectionExt as _;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
+use effects::{Effect, EffectArt, Landed};
 use figure::{Art, Peer};
 use homeview::office::{ActionKind, Toast};
 use menu::{Command, Item, Menu};
@@ -84,6 +86,7 @@ struct Overlay {
     input_rects: Option<Vec<(i16, i16, u16, u16)>>,
     menu: Option<Menu>,
     menu_dirty: bool,
+    effects: Vec<Effect>,
 }
 
 /// Нажали на человечка: ещё не ясно — клик (меню) или перетаскивание.
@@ -147,6 +150,7 @@ struct App {
     press: Option<Press>,
     /// Уведомления — в углу основного монитора (overlays[0]).
     toasts: Toasts,
+    effect_art: Option<EffectArt>,
     stats: Stats,
     frame: Duration,
     next_frame: Instant,
@@ -249,6 +253,7 @@ impl App {
                 unsafe {
                     eprintln!("GL: {} / {}", gl.get_parameter_string(glow::VERSION), gl.get_parameter_string(glow::RENDERER));
                     self.batch = Some(SpriteBatch::new(&gl));
+                    self.effect_art = Some(EffectArt::new(&gl, &self.opts.season));
                     self.particles = Some(ParticleRenderer::new(gl));
                 }
             }
@@ -264,7 +269,7 @@ impl App {
             eprintln!("Окно {name}: {}x{} +{}+{} xid=0x{id:x}", size.width, size.height, pos.x, pos.y);
             self.overlays.push(Overlay { window, pos: (pos.x as f32, pos.y as f32), xid: id, surface, layers, width: w, height: h, peers,
                                          cursor: (-1.0, -1.0), hovering: false, input_rects: None,
-                                         menu: None, menu_dirty: false });
+                                         menu: None, menu_dirty: false, effects: Vec::new() });
             context = Some(ctx);
         }
         self.context = context;
@@ -346,11 +351,32 @@ impl App {
                 OfficeEvent::PeerHops(id) => if let Some(p) = find_peer(overlays, &id) {
                     p.hop();
                 },
-                OfficeEvent::IncomingProjectile(id) => if let Some(p) = find_peer(overlays, &id) {
-                    // Полёт снаряда «в экран» — следующим шагом, пока только реплика
-                    let taunt = THROW_TAUNTS[fastrand::usize(..THROW_TAUNTS.len())];
-                    unsafe { p.say(gl, text, taunt, 2.0) };
-                },
+                OfficeEvent::IncomingProjectile(id) => {
+                    // Коллега кинул в нас: его человечек замахивается, снаряд летит «в экран» и прилипает
+                    let index = overlays.iter().position(|o| o.peers.iter().any(|p| p.info.id == id)).unwrap_or(0);
+                    let o = &mut overlays[index];
+                    let (start, delay) = match o.peers.iter_mut().find(|p| p.info.id == id) {
+                        Some(p) => {
+                            p.throw_motion();
+                            let taunt = THROW_TAUNTS[fastrand::usize(..THROW_TAUNTS.len())];
+                            unsafe { p.say(gl, text, taunt, 2.0) };
+                            (p.hand_point(), 0.3)
+                        }
+                        None => ((60.0 + fastrand::f32() * (o.width - 120.0), o.height + 40.0), 0.0),
+                    };
+                    // Целимся рядом с курсором, если он на этом мониторе
+                    let pointer = self.x11.as_ref().and_then(|c| c.query_pointer(self.root).ok()?.reply().ok())
+                        .map(|r| (r.root_x as f32 - o.pos.0, r.root_y as f32 - o.pos.1))
+                        .filter(|&(x, y)| x >= 0.0 && y >= 0.0 && x < o.width && y < o.height);
+                    let (tx, ty) = match pointer {
+                        Some((x, y)) => (x + fastrand::f32() * 120.0 - 60.0, y + fastrand::f32() * 100.0 - 50.0),
+                        None => (o.width * (0.25 + fastrand::f32() * 0.5), o.height * (0.3 + fastrand::f32() * 0.35)),
+                    };
+                    let target = (tx.clamp(90.0, o.width - 90.0), ty.clamp(90.0, o.height - 90.0));
+                    let control = ((start.0 + target.0) / 2.0, start.1.min(target.1) - 160.0);
+                    o.effects.push(Effect::flying(start, target, control, 0.8, 0.35, 3.4, 28.0, true, delay,
+                                                  Landed::Splat { x: target.0, y: target.1 }));
+                }
             }
         }
     }
@@ -391,6 +417,8 @@ impl App {
         // Сначала второстепенные (без ожидания vsync), последним — основной, его swap ждёт кадр.
         let toasts = &mut self.toasts;
         toasts.tick(dt);
+        let effect_art = self.effect_art.as_ref();
+        let mut landed: Vec<(usize, Landed)> = Vec::new();
         for (index, overlay) in self.overlays.iter_mut().enumerate().rev() {
             ctx.make_current(&overlay.surface).unwrap();
             unsafe {
@@ -403,6 +431,14 @@ impl App {
                 for p in &mut overlay.peers {
                     p.tick(dt, overlay.width);
                     p.draw(gl, batch, now);
+                }
+                let mut done = Vec::new();
+                overlay.effects.retain_mut(|e| e.tick(dt, &mut done));
+                landed.extend(done.into_iter().map(|l| (index, l)));
+                if let Some(art) = effect_art {
+                    for e in &overlay.effects {
+                        e.draw(gl, batch, art);
+                    }
                 }
                 if index == 0 {
                     toasts.draw(gl, batch, text, overlay.width);
@@ -418,6 +454,9 @@ impl App {
             overlay.surface.swap_buffers(ctx).unwrap();
         }
         unsafe { self.toasts.sweep(gl) };
+        for (index, l) in landed {
+            self.on_landed(index, l);
+        }
         let cpu = cpu_started.elapsed();
         self.update_input_regions();
 
@@ -606,13 +645,17 @@ impl App {
             Command::Tea(id) => self.office.tea(&id),
             Command::Throw(id) => {
                 if self.office.can_throw() {
-                    // Полёт снаряда — следующим шагом; пока сразу «попадание»
-                    self.office.projectile_hit(&id);
-                    let (Some(renderer), Some(text)) = (&self.particles, &mut self.text) else { return };
-                    if let Some(p) = find_peer(&mut self.overlays, &id) {
-                        p.hop();
-                        let reaction = HIT_REACTIONS[fastrand::usize(..HIT_REACTIONS.len())];
-                        unsafe { p.say(&renderer.gl, text, reaction, 2.0) };
+                    // Мы кидаем: снаряд летит из-под края экрана в человечка; сервер узнаёт о броске при попадании
+                    let found = self.overlays.iter_mut()
+                        .find_map(|o| o.peers.iter().find(|p| p.info.id == id).map(|p| p.chest_point()).map(|c| (o, c)));
+                    match found {
+                        Some((o, point)) => {
+                            let start = (point.0 + if point.0 < o.width / 2.0 { 140.0 } else { -140.0 }, o.height + 60.0);
+                            let control = ((start.0 + point.0) / 2.0, point.1.min(start.1) - 140.0);
+                            o.effects.push(Effect::flying(start, point, control, 0.5, 3.0, 0.8, 30.0, false, 0.0,
+                                                          Landed::Hit { peer_id: id.clone() }));
+                        }
+                        None => self.office.projectile_hit(&id),
                     }
                 }
             }
@@ -633,6 +676,28 @@ impl App {
             Command::Show(id) => self.set_shown(&id, true),
         }
         self.office_tick();
+    }
+
+    fn on_landed(&mut self, index: usize, landed: Landed) {
+        match landed {
+            Landed::Splat { x, y } => self.overlays[index].effects.push(Effect::splat(x, y, 130.0)),
+            Landed::Hit { peer_id } => {
+                self.office.projectile_hit(&peer_id);
+                let (Some(renderer), Some(text), Some(art)) = (&self.particles, &mut self.text, &self.effect_art) else { return };
+                // Человечка могли за это время утащить на другой монитор
+                let colors = art.burst_colors();
+                for o in &mut self.overlays {
+                    if let Some(p) = o.peers.iter_mut().find(|p| p.info.id == peer_id) {
+                        let (x, y) = p.chest_point();
+                        p.flinch();
+                        let reaction = HIT_REACTIONS[fastrand::usize(..HIT_REACTIONS.len())];
+                        unsafe { p.say(&renderer.gl, text, reaction, 2.0) };
+                        o.effects.push(Effect::burst(x, y, colors, 14));
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn set_shown(&mut self, id: &str, shown: bool) {
@@ -807,7 +872,7 @@ fn main() {
     let toasts = Toasts::new(st_scale);
     let mut app = App {
         opts, start: now, overlays: Vec::new(), context: None, particles: None, batch: None, text: None, x11: None,
-        root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None, toasts,
+        root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None, toasts, effect_art: None,
         stats: Stats::default(), frame, next_frame: now, last_tick: now,
     };
     event_loop.run_app(&mut app).expect("run");

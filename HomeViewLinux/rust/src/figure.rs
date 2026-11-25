@@ -131,6 +131,8 @@ pub struct Peer {
     walk_time: f32,
     wave: Option<Clip>,
     hop: Option<Clip>,
+    throw: Option<Clip>,
+    flinch: Option<Clip>,
     tag: Label,
     bubble: Option<(Label, Instant, Instant)>,
     /// Высота ступней над землёй (тащат мышью или падает после этого).
@@ -158,7 +160,7 @@ impl Peer {
             info: info.clone(), status: info.status, style: info.avatar, parts: Parts::build(gl, art, info.avatar),
             x, ground_y: 0.0, scale, text_scale,
             facing: 1.0, target_x: x, pause: 1.0 + fastrand::f32() * 3.0, walking: false, walk_time: 0.0,
-            wave: None, hop: None, tag, bubble: None, air: 0.0, fall_speed: 0.0, dragged: false, drag_time: 0.0,
+            wave: None, hop: None, throw: None, flinch: None, tag, bubble: None, air: 0.0, fall_speed: 0.0, dragged: false, drag_time: 0.0,
             screen_w: f32::MAX,
         }
     }
@@ -275,6 +277,28 @@ impl Peer {
         }
     }
 
+    /// Замах передней рукой (бросок снаряда).
+    pub fn throw_motion(&mut self) {
+        self.throw = Some(Clip { values: &[0.15, -2.6, 0.9, 0.15], times: &[0.0, 0.45, 0.64, 1.0], duration: 0.55,
+                                 start: Instant::now() });
+    }
+
+    /// Вздрагивает от попадания.
+    pub fn flinch(&mut self) {
+        self.flinch = Some(Clip { values: &[0.0, -0.25, 0.18, 0.0], times: &[0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+                                  duration: 0.3, start: Instant::now() });
+    }
+
+    /// Откуда летит брошенный им снаряд (экранные координаты).
+    pub fn hand_point(&self) -> (f32, f32) {
+        (self.x + self.facing * 5.0 * self.scale, self.ground_y - self.air - 34.0 * self.scale)
+    }
+
+    /// Куда попадает снаряд.
+    pub fn chest_point(&self) -> (f32, f32) {
+        (self.x, self.ground_y - self.air - 26.0 * self.scale)
+    }
+
     pub fn hop(&mut self) {
         self.hop = Some(Clip { values: &[0.0, 14.0, 0.0], times: &[0.0, 0.5, 1.0], duration: 0.34, start: Instant::now() });
     }
@@ -332,7 +356,7 @@ impl Peer {
     pub unsafe fn draw(&mut self, gl: &glow::Context, batch: &mut SpriteBatch, now: Instant) {
         let s = self.scale;
         let busy = self.status == Status::Busy;
-        let (mut leg_l, mut leg_r, mut arm_back, arm_front, mut dy, mut lift) = (0.0, 0.0, 0.0, 0.15, 0.0, 0.0);
+        let (mut leg_l, mut leg_r, mut arm_back, mut arm_front, mut dy, mut lift) = (0.0, 0.0, 0.0, 0.15, 0.0, 0.0);
         if self.dragged || self.air > 0.0 {
             // Висит в воздухе: болтает ногами, руки вверх
             let swing = (self.drag_time * 7.0).sin();
@@ -346,9 +370,17 @@ impl Peer {
         }
         if let Some(v) = self.wave.as_ref().and_then(|c| c.value(now)) { arm_back = v } else { self.wave = None }
         if let Some(v) = self.hop.as_ref().and_then(|c| c.value(now)) { lift += v } else { self.hop = None }
+        if let Some(v) = self.throw.as_ref().and_then(|c| c.value(now)) { arm_front = v } else { self.throw = None }
+        let rot = match self.flinch.as_ref().and_then(|c| c.value(now)) {
+            Some(v) => v,
+            None => {
+                self.flinch = None;
+                0.0
+            }
+        };
 
         let alpha = if busy { 0.55 } else { 1.0 };
-        let m = Affine::IDENTITY.translate(self.x, self.ground_y - self.air).scale(self.facing * s, -s).translate(0.0, lift + dy);
+        let m = Affine::IDENTITY.translate(self.x, self.ground_y - self.air).scale(self.facing * s, -s).translate(0.0, lift + dy).rotate(rot);
         let white = [1.0, 1.0, 1.0];
         let part = |batch: &mut SpriteBatch, tex: Texture, at: (f32, f32), angle: f32, b: BoxPt| {
             let mm = m.translate(at.0, at.1).rotate(angle);
