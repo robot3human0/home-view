@@ -12,6 +12,9 @@ use crate::text::{rounded_rect, to_image, Text};
 
 const WIDTH: f32 = 340.0;
 const MARGIN: f32 = 14.0;
+/// Сверху — ниже верхней панели GNOME (её высота 32–40 px; рабочая область X её не исключает).
+/// Оверлей стоит выше панели, и карточка поверх трея забирала бы клики по его значкам.
+const TOP_OFFSET: f32 = 56.0;
 const GAP: f32 = 10.0;
 const MAX_VISIBLE: usize = 5;
 const FADE: f32 = 0.2;
@@ -138,7 +141,7 @@ impl Toasts {
 
     fn restack(&mut self) {
         let m = Metrics { k: self.scale };
-        let mut y = m.px(MARGIN);
+        let mut y = TOP_OFFSET;
         for c in &mut self.cards {
             if c.closing.is_some() {
                 continue;

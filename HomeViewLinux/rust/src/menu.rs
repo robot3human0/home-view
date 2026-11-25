@@ -25,6 +25,7 @@ fn split_icon(t: &str) -> Option<(&str, &str)> {
     t.split_once("  ").filter(|(icon, _)| icon.chars().count() <= 3)
 }
 
+#[derive(Clone)]
 pub enum Item {
     /// Заголовок или пояснение — серым, не нажимается.
     Info(String),

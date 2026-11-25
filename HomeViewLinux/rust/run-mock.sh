@@ -4,6 +4,7 @@
 #   ./run-mock.sh [секунд] [ботов] [параметры клиента…]
 #   (по умолчанию — без ограничения, 4 бота; выход — Ctrl+C), например:
 #   ./run-mock.sh 300 4 --season winter --pile-speed 20
+#   MOCK_ARGS=--quiet ./run-mock.sh …   — боты сами ничего не делают, только отвечают
 #
 # Настройки — временная копия твоих (~/.config/HomeView/HomeViewLinux.conf) с адресом mock и без
 # кода офиса: имя, шапка и ID те же, а настоящий файл не меняется.
@@ -28,7 +29,7 @@ fi
 sed -i "/^\[General\]/a serverAddress=127.0.0.1:$PORT" "$CFG/HomeView/HomeViewLinux.conf"
 
 (cd "$HERE" && cargo build --release --quiet --bin homeview)
-"$PYTHON" "$LINUX_DIR/tools/mock_server.py" --bots "$BOTS" --port "$PORT" > "$CFG/mock.log" 2>&1 &
+"$PYTHON" "$LINUX_DIR/tools/mock_server.py" --bots "$BOTS" --port "$PORT" ${MOCK_ARGS:-} > "$CFG/mock.log" 2>&1 &
 MOCK=$!
 sleep 1.5
 echo "mock: $BOTS бота на 127.0.0.1:$PORT (журнал: $CFG/mock.log)"

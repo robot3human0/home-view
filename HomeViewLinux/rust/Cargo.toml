@@ -28,6 +28,8 @@ serde_json = "1"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 mdns-sd = "0.13"
 log = "0.4"
+tray-icon = { version = "0.21", default-features = false }
+gtk = "0.18"
 
 [profile.release]
 lto = "thin"

@@ -15,6 +15,7 @@ mod menu;
 mod particles;
 mod text;
 mod toasts;
+mod tray;
 
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
@@ -54,6 +55,7 @@ use ground::{GroundRenderer, Pile};
 use homeview::office::{ActionKind, Toast};
 use menu::{Command, Item, Menu};
 use toasts::{Click, Toasts};
+use tray::{TrayCommand, TrayHandle, TrayState};
 use gfx::SpriteBatch;
 use particles::{GpuLayer, ParticleRenderer};
 use text::Text;
@@ -61,6 +63,16 @@ use text::Text;
 const IDLE_CHECK: Duration = Duration::from_secs(15);
 const THROW_TAUNTS: [&str; 4] = ["Лови!", "Держи!", "На тебе!", "Привет!"];
 const HIT_REACTIONS: [&str; 4] = ["Ой!", "Эй!", "Ну, держись!", "Ай!"];
+
+/// (эмодзи, название, что падает) — как в season.py
+fn season_titles(season: &str) -> (&'static str, &'static str, &'static str) {
+    match season {
+        "spring" => ("🌸", "Весна", "лепестки урюка"),
+        "summer" => ("☀️", "Лето", "тополиный пух"),
+        "autumn" => ("🍂", "Осень", "листья"),
+        _ => ("❄️", "Зима", "снег"),
+    }
+}
 
 /// (эмодзи, чем кидаемся) — как в season.py
 fn season_projectile(season: &str) -> (&'static str, &'static str) {
@@ -91,6 +103,8 @@ struct Overlay {
     effects: Vec<Effect>,
     /// Снег (листья, лепестки) на земле этого монитора.
     pile: Pile,
+    /// Прежняя куча растворяется (смена сезона, «Убрать снег»).
+    old_pile: Option<Pile>,
 }
 
 /// Нажали на человечка: ещё не ясно — клик (меню) или перетаскивание.
@@ -117,6 +131,11 @@ struct Options {
     density: f32,
     /// Отладка: во сколько раз быстрее растёт куча на земле.
     pile_speed: f32,
+    /// Отладка: «в нас» прилетает снаряд каждые N секунд (0 — нет).
+    test_throws: f32,
+    /// Отладка: без значка в трее / без опроса фокуса Shell.
+    no_tray: bool,
+    no_focus_poll: bool,
 }
 
 #[derive(Default)]
@@ -158,6 +177,23 @@ struct App {
     toasts: Toasts,
     effect_art: Option<EffectArt>,
     ground: Option<GroundRenderer>,
+    /// Шейдеры прежнего сезона — пока растворяется прежняя куча.
+    old_ground: Option<GroundRenderer>,
+    ground_fade: f32,
+    tray: Option<TrayHandle>,
+    tray_tx: Sender<TrayCommand>,
+    tray_rx: Receiver<TrayCommand>,
+    tray_signature: String,
+    tray_dirty: bool,
+    tray_spawned: bool,
+    tray_icon: (String, Vec<u8>),
+    last_season_check: Instant,
+    quit: bool,
+    /// Окно-сцена GNOME Shell (у него фокус, пока открыто меню трея, «Обзор» и т. п.).
+    shell_window: Option<u32>,
+    last_focus_check: Instant,
+    shell_busy_until: Option<Instant>,
+    last_test_throw: Instant,
     stats: Stats,
     frame: Duration,
     next_frame: Instant,
@@ -278,7 +314,7 @@ impl App {
             self.overlays.push(Overlay { window, pos: (pos.x as f32, pos.y as f32), xid: id, surface, layers, width: w, height: h, peers,
                                          cursor: (-1.0, -1.0), hovering: false, input_rects: None,
                                          menu: None, menu_dirty: false, effects: Vec::new(),
-                                         pile: Pile::new(w, h) });
+                                         pile: Pile::new(w, h), old_pile: None });
             context = Some(ctx);
         }
         self.context = context;
@@ -289,6 +325,188 @@ impl App {
                   if settings.server_address.is_empty() { "ищем через mDNS" } else { settings.server_address.as_str() });
         self.office.apply_settings(settings);
         self.office_tick();
+    }
+
+    /// Трей (libayatana-appindicator в своём GTK-потоке); выбор пункта будит главный цикл.
+    /// Появляется через пару секунд после старта, когда подключение уже установлено.
+    fn spawn_tray(&mut self) {
+        self.tray_spawned = true;
+        let Some(state) = self.tray_state() else { return };
+        self.tray_signature = tray::signature(&state);
+        let proxy = self.proxy.clone();
+        match TrayHandle::spawn(state, self.tray_tx.clone(), Box::new(move || { let _ = proxy.send_event(()); })) {
+            Ok(handle) => self.tray = Some(handle),
+            Err(e) => eprintln!("Трей недоступен: {e}"),
+        }
+    }
+
+    /// Снимок для меню трея; в панель уходит, только если что-то изменилось.
+    fn update_tray(&mut self) {
+        self.tray_dirty = false;
+        if self.tray.is_none() {
+            return;
+        }
+        let Some(state) = self.tray_state() else { return };
+        let signature = tray::signature(&state);
+        if signature != self.tray_signature {
+            self.tray_signature = signature;
+            if let Some(handle) = &self.tray {
+                handle.update(state);
+            }
+        }
+    }
+
+    fn tray_state(&mut self) -> Option<TrayState> {
+        let text = self.text.as_mut()?;
+        let s = &self.store.settings;
+        let (emoji, title, particles) = season_titles(&self.opts.season);
+        if self.tray_icon.0 != emoji {
+            self.tray_icon = (emoji.to_string(), tray::emoji_icon(text, emoji, 64));
+        }
+        let peers = self.office.online_peers().into_iter().map(|p| {
+            let mut label = if p.team.is_empty() { p.name.clone() } else { format!("{} · {}", p.name, p.team) };
+            if s.hidden_peers.contains(&p.id) {
+                label = format!("🙈 {label}");
+            }
+            tray::Peer { id: p.id.clone(), label }
+        }).collect();
+        let state = TrayState {
+            status_line: self.office.status_line(),
+            failed: matches!(self.office.connection, homeview::office::Connection::Failed(_)),
+            connected: matches!(self.office.connection, homeview::office::Connection::Connected(_)),
+            my_status: s.my_status,
+            effective_status: self.office.effective_status(),
+            peers,
+            season_setting: s.season.clone(),
+            season_title: format!("{emoji} {title}"),
+            particle_title: particles.into(),
+            effects: s.effects_enabled,
+            icon: self.tray_icon.1.clone(),
+            icon_size: 64,
+            icon_key: emoji.to_string(),
+        };
+        Some(state)
+    }
+
+    fn tray_command(&mut self, command: TrayCommand) {
+        let mut s = self.store.settings.clone();
+        match command {
+            TrayCommand::Peer(c) => self.run(c),
+            TrayCommand::PeerMenu(id) => self.open_peer_menu_at_pointer(&id),
+            TrayCommand::SetStatus(status) => {
+                s.my_status = status;
+                self.store.save(s.clone());
+                self.office.apply_settings(s);
+            }
+            TrayCommand::Reconnect => self.office.reconnect(),
+            TrayCommand::SetSeason(season) => {
+                s.season = season;
+                self.store.save(s);
+                self.apply_season();
+            }
+            TrayCommand::SetEffects(on) => {
+                s.effects_enabled = on;
+                self.store.save(s);
+            }
+            TrayCommand::ClearSnow => self.fade_out_piles(false),
+            TrayCommand::Settings => {
+                if let Some(text) = &mut self.text {
+                    self.toasts.post(text, Toast { icon: "⚙".into(), title: "Окно настроек — следующим шагом".into(),
+                        body: "Пока настройки общие с Python-клиентом: можно поменять их там.".into(),
+                        actions: Vec::new(), auto_dismiss: Duration::from_secs(5), key: Some("settings".into()) });
+                }
+            }
+            TrayCommand::Quit => self.quit = true,
+        }
+        self.tray_dirty = true;
+    }
+
+    /// Раз в 100 мс: фокус ввода у самого GNOME Shell (его окно-сцена с именем «gnome-shell»)?
+    fn check_shell_busy(&mut self) {
+        let now = Instant::now();
+        if now - self.last_focus_check < Duration::from_millis(100) {
+            return;
+        }
+        self.last_focus_check = now;
+        if self.opts.no_focus_poll {
+            return;
+        }
+        let Some(conn) = &self.x11 else { return };
+        let Some(focus) = conn.get_input_focus().ok().and_then(|c| c.reply().ok()).map(|r| r.focus) else { return };
+        if self.shell_window.is_none() && focus > 1 {
+            // имя окна-сцены есть только в _NET_WM_NAME (UTF8_STRING), WM_NAME у него нет
+            let atom = conn.intern_atom(true, b"_NET_WM_NAME").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+            let name = atom.and_then(|atom| conn.get_property(false, focus, atom,
+                                         x11rb::protocol::xproto::AtomEnum::ANY, 0, 64).ok())
+                .and_then(|c| c.reply().ok()).map(|r| String::from_utf8_lossy(&r.value).into_owned());
+            if name.as_deref() == Some("gnome-shell") {
+                self.shell_window = Some(focus);
+            }
+        }
+        if Some(focus) == self.shell_window {
+            if self.shell_busy_until.is_none_or(|t| now >= t) {
+                eprintln!("GNOME Shell показывает своё меню — 15 кадр/с");
+            }
+            self.shell_busy_until = Some(now + Duration::from_millis(500));
+        }
+    }
+
+    /// Меню коллеги из трея: открываем наше меню у курсора, на том мониторе, где курсор.
+    fn open_peer_menu_at_pointer(&mut self, id: &str) {
+        let Some(pointer) = self.x11.as_ref().and_then(|c| c.query_pointer(self.root).ok()?.reply().ok()) else { return };
+        let (gx, gy) = (pointer.root_x as f32, pointer.root_y as f32);
+        let Some(index) = self.overlays.iter()
+            .position(|o| gx >= o.pos.0 && gx < o.pos.0 + o.width && gy >= o.pos.1 && gy < o.pos.1 + o.height) else { return };
+        let items = self.peer_menu(id);
+        let o = &self.overlays[index];
+        let (cx, cy, w, h) = (gx - o.pos.0, gy - o.pos.1, o.width, o.height);
+        let Some(text) = &mut self.text else { return };
+        let menu = Menu::new(text, items, (cx, cy), (w, h), self.store.settings.toast_scale);
+        let o = &mut self.overlays[index];
+        if let (Some(mut old), Some(r)) = (o.menu.take(), &self.particles) {
+            unsafe { old.delete(&r.gl) };
+        }
+        o.menu = Some(menu);
+        o.menu_dirty = true;
+        self.update_input_regions();
+    }
+
+    /// Сезон из настроек (auto — по месяцу) изменился: осадки, куча, снаряды — нового сезона.
+    fn apply_season(&mut self) {
+        let s = &self.store.settings;
+        let season = if s.season == "auto" { particles::season_for_today().to_string() } else { s.season.clone() };
+        if season == self.opts.season {
+            return;
+        }
+        eprintln!("Сезон: {} → {season}", self.opts.season);
+        self.opts.season = season;
+        let Some(renderer) = self.particles.as_mut() else { return };
+        for o in &mut self.overlays {
+            unsafe {
+                for l in &o.layers {
+                    l.delete(&renderer.gl);
+                }
+                o.layers = renderer.prepare(&self.opts.season, o.width, o.height, self.opts.density);
+            }
+        }
+        let gl = &renderer.gl;
+        self.effect_art = Some(unsafe { EffectArt::new(gl, &self.opts.season) });
+        let new_ground = unsafe { GroundRenderer::new(gl, &self.opts.season) };
+        self.old_ground = self.ground.replace(new_ground);
+        self.fade_out_piles(true);
+    }
+
+    /// Прежняя куча растворяется за 1.5 с, новая растёт с нуля.
+    fn fade_out_piles(&mut self, keep_old_renderer: bool) {
+        if !keep_old_renderer {
+            self.old_ground = None; // рисовать прежнюю кучу текущими шейдерами
+        }
+        for o in &mut self.overlays {
+            let fresh = Pile::new(o.width, o.height);
+            let old = std::mem::replace(&mut o.pile, fresh);
+            o.old_pile = (!old.is_empty()).then_some(old);
+        }
+        self.ground_fade = 1.0;
     }
 
     /// Сетевые события офиса → человечки и облачка; раз в 15 с — проверка бездействия.
@@ -303,8 +521,25 @@ impl App {
         while let Ok((to, message)) = self.compose_rx.try_recv() {
             self.office.chat(to.as_deref(), &message);
         }
+        while let Ok(command) = self.tray_rx.try_recv() {
+            self.tray_command(command);
+        }
+        if now - self.last_season_check >= Duration::from_secs(60) {
+            self.last_season_check = now;
+            self.apply_season(); // «auto»: сменился месяц
+        }
+        if self.opts.test_throws > 0.0 && now - self.last_test_throw >= Duration::from_secs_f32(self.opts.test_throws) {
+            self.last_test_throw = now;
+            if let Some(id) = self.overlays.first().and_then(|o| o.peers.first()).map(|p| p.info.id.clone()) {
+                eprintln!("{:6.2} ТЕСТ: снаряд в нас", self.start.elapsed().as_secs_f32());
+                self.office.handle(homeview::protocol::ServerMessage::Projectile { from: id });
+            }
+        }
         self.office.poll();
         let events = self.office.take_events();
+        if !events.is_empty() {
+            self.tray_dirty = true;
+        }
         if events.is_empty() {
             return;
         }
@@ -400,8 +635,15 @@ impl App {
                 vec![Rectangle { x: 0, y: 0, width: o.width as u16, height: o.height as u16 }]
             } else {
                 let cards = if o.pos == first_pos { self.toasts.rects(o.width) } else { Vec::new() };
+                // Сетка 16 px с запасом: область меняется, только когда человечек сдвинулся на 16 px
+                // (≈4 раза в секунду), а не каждый кадр. Каждое изменение XShape заставляет композитор
+                // пересчитывать окно под курсором — при 50 изменениях в секунду GNOME Shell терял клики
+                // по значкам в трее (все значки «залипали»; проверено 2026-11-25).
+                const GRID: f32 = 16.0;
                 o.peers.iter().flat_map(|p| p.hit_rects()).chain(cards).map(|(x, y, w, h)| {
-                    Rectangle { x: x.floor() as i16, y: y.floor() as i16, width: w.ceil() as u16, height: h.ceil() as u16 }
+                    let (x0, y0) = (((x - 4.0) / GRID).floor() * GRID, ((y - 4.0) / GRID).floor() * GRID);
+                    let (x1, y1) = (((x + w + 4.0) / GRID).ceil() * GRID, ((y + h + 4.0) / GRID).ceil() * GRID);
+                    Rectangle { x: x0 as i16, y: y0 as i16, width: (x1 - x0) as u16, height: (y1 - y0) as u16 }
                 }).collect()
             };
             let key: Vec<_> = rects.iter().map(|r| (r.x, r.y, r.width, r.height)).collect();
@@ -428,6 +670,9 @@ impl App {
         toasts.tick(dt);
         let effect_art = self.effect_art.as_ref();
         let ground = &mut self.ground;
+        let old_ground = &mut self.old_ground;
+        self.ground_fade = (self.ground_fade - dt / 1.5).max(0.0);
+        let fade = self.ground_fade;
         let (season, density, snowing) = (self.opts.season.as_str(), self.opts.density, self.store.settings.effects_enabled);
         let pile_dt = dt * self.opts.pile_speed;
         let mut landed: Vec<(usize, Landed)> = Vec::new();
@@ -442,6 +687,12 @@ impl App {
                 }
                 gl.bind_vertex_array(Some(renderer.vao));
                 overlay.pile.tick(pile_dt, season, density, snowing);
+                if fade <= 0.0 {
+                    overlay.old_pile = None;
+                }
+                if let (Some(old), Some(g)) = (&mut overlay.old_pile, old_ground.as_mut().or(ground.as_mut())) {
+                    g.draw(gl, old, overlay.width, overlay.height, fade);
+                }
                 if let Some(g) = ground.as_mut() {
                     g.draw(gl, &mut overlay.pile, overlay.width, overlay.height, 1.0);
                 }
@@ -837,6 +1088,17 @@ impl ApplicationHandler<()> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.tray_spawned && !self.opts.no_tray && !self.overlays.is_empty() && self.start.elapsed() >= Duration::from_millis(2500) {
+            self.spawn_tray();
+        }
+        if self.tray_dirty {
+            self.update_tray();
+        }
+        if self.quit {
+            eprintln!("Выход из меню трея");
+            event_loop.exit();
+            return;
+        }
         if self.opts.seconds > 0.0 && self.start.elapsed().as_secs_f32() >= self.opts.seconds {
             let s = &self.stats;
             let (from, cpu0) = s.steady_from.unwrap_or((self.start, 0.0));
@@ -848,11 +1110,19 @@ impl ApplicationHandler<()> for App {
             event_loop.exit();
             return;
         }
+        self.check_shell_busy();
         if Instant::now() >= self.next_frame {
             self.office_tick();
             self.render();
             // Ограничитель: следующий кадр не раньше чем через 1/fps (vsync сверху выравнивает).
-            self.next_frame = (self.next_frame + self.frame).max(Instant::now() + self.frame / 2);
+            // Пока GNOME Shell показывает своё меню — 15 кадр/с: на 60 он не успевает его собрать
+            // (меню трея рисовалось кусками десятки секунд — проверено 2026-11-25).
+            let frame = if self.shell_busy_until.is_some_and(|t| Instant::now() < t) {
+                self.frame.max(Duration::from_millis(66))
+            } else {
+                self.frame
+            };
+            self.next_frame = (self.next_frame + frame).max(Instant::now() + frame / 2);
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
@@ -863,7 +1133,7 @@ fn main() {
     let st = store.settings.clone();
     let st_scale = st.toast_scale;
     let season = if st.season == "auto" { particles::season_for_today().to_string() } else { st.season.clone() };
-    let mut opts = Options { small: false, seconds: 0.0, season, fps: st.fps as f32, density: st.density, pile_speed: 1.0 };
+    let mut opts = Options { small: false, seconds: 0.0, season, fps: st.fps as f32, density: st.density, pile_speed: 1.0, test_throws: 0.0, no_tray: false, no_focus_poll: false };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -875,6 +1145,9 @@ fn main() {
             "--fps" => { opts.fps = next(i).parse().unwrap_or(60.0); i += 1; }
             "--density" => { opts.density = next(i).parse().unwrap_or(0.7); i += 1; }
             "--pile-speed" => { opts.pile_speed = next(i).parse().unwrap_or(1.0); i += 1; }
+            "--no-tray" => opts.no_tray = true,
+            "--no-focus-poll" => opts.no_focus_poll = true,
+            "--test-throws" => { opts.test_throws = next(i).parse().unwrap_or(0.0); i += 1; }
             other => { eprintln!("неизвестный параметр {other}"); std::process::exit(2); }
         }
         i += 1;
@@ -889,10 +1162,14 @@ fn main() {
     let waker = proxy.clone();
     let office = Office::new(st, Arc::new(move || { let _ = waker.send_event(()); }));
     let (compose_tx, compose_rx) = mpsc::channel();
+    let (tray_tx, tray_rx) = mpsc::channel();
     let toasts = Toasts::new(st_scale);
     let mut app = App {
         opts, start: now, overlays: Vec::new(), context: None, particles: None, batch: None, text: None, x11: None,
         root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None, toasts, effect_art: None, ground: None,
+        old_ground: None, ground_fade: 0.0, tray: None, tray_tx, tray_rx, tray_signature: String::new(), tray_dirty: true, tray_spawned: false,
+        tray_icon: (String::new(), Vec::new()), last_season_check: now, quit: false,
+        shell_window: None, last_focus_check: now, shell_busy_until: None, last_test_throw: now,
         stats: Stats::default(), frame, next_frame: now, last_tick: now,
     };
     event_loop.run_app(&mut app).expect("run");

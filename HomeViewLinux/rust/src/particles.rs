@@ -141,6 +141,13 @@ pub struct GpuLayer {
     alpha: f32,
 }
 
+impl GpuLayer {
+    /// Текстуры общие для слоёв (кэш в ParticleRenderer) — удаляем только буфер.
+    pub unsafe fn delete(&self, gl: &glow::Context) {
+        gl.delete_buffer(self.buffer);
+    }
+}
+
 pub struct ParticleRenderer {
     pub gl: glow::Context,
     pub vao: glow::VertexArray,
