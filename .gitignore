@@ -22,3 +22,6 @@ build/
 
 # Rust (HomeViewLinux/rust)
 target/
+
+# Локальные заметки Claude (личное — репозиторий публичный)
+CLAUDE.local.md
