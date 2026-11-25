@@ -35,6 +35,10 @@ impl Text {
     }
 
     fn layout(&mut self, text: &str, px: f32, weight: Weight, wrap: Option<f32>) -> (Buffer, f32, f32) {
+        self.layout_aligned(text, px, weight, wrap, Align::Center)
+    }
+
+    fn layout_aligned(&mut self, text: &str, px: f32, weight: Weight, wrap: Option<f32>, align: Align) -> (Buffer, f32, f32) {
         let text = &emoji_presentation(text);
         let metrics = Metrics::new(px, (px * 1.2).ceil());
         let mut buffer = Buffer::new(&mut self.fonts, metrics);
@@ -46,7 +50,7 @@ impl Text {
         buffer.set_rich_text(&mut self.fonts, spans, attrs, Shaping::Advanced);
         if wrap.is_some() {
             for line in buffer.lines.iter_mut() {
-                line.set_align(Some(Align::Center));
+                line.set_align(Some(align));
             }
         }
         buffer.shape_until_scroll(&mut self.fonts, false);
@@ -82,6 +86,18 @@ impl Text {
     /// Нарисовать строку в картинку: (x, y) — левый верхний угол строки.
     pub fn draw_line(&mut self, pixmap: &mut Pixmap, text: &str, px: f32, weight: Weight, x: f32, y: f32, color: Color) {
         let (mut buffer, _, _) = self.layout(text, px, weight, None);
+        self.draw_text(pixmap, &mut buffer, x.round(), y.round(), color);
+    }
+
+    /// Абзац с переносом по ширине `width`, по левому краю: (ширина, высота).
+    pub fn measure_wrapped(&mut self, text: &str, px: f32, weight: Weight, width: f32) -> (f32, f32) {
+        let (_, w, h) = self.layout_aligned(text, px, weight, Some(width), Align::Left);
+        (w, h)
+    }
+
+    pub fn draw_wrapped(&mut self, pixmap: &mut Pixmap, text: &str, px: f32, weight: Weight, width: f32,
+                        x: f32, y: f32, color: Color) {
+        let (mut buffer, _, _) = self.layout_aligned(text, px, weight, Some(width), Align::Left);
         self.draw_text(pixmap, &mut buffer, x.round(), y.round(), color);
     }
 

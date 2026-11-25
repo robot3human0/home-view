@@ -12,6 +12,7 @@ mod gfx;
 mod menu;
 mod particles;
 mod text;
+mod toasts;
 
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
@@ -46,7 +47,9 @@ use x11rb::protocol::screensaver::ConnectionExt as _;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use figure::{Art, Peer};
+use homeview::office::{ActionKind, Toast};
 use menu::{Command, Item, Menu};
+use toasts::{Click, Toasts};
 use gfx::SpriteBatch;
 use particles::{GpuLayer, ParticleRenderer};
 use text::Text;
@@ -142,6 +145,8 @@ struct App {
     compose_tx: Sender<(Option<String>, String)>,
     compose_rx: Receiver<(Option<String>, String)>,
     press: Option<Press>,
+    /// Уведомления — в углу основного монитора (overlays[0]).
+    toasts: Toasts,
     stats: Stats,
     frame: Duration,
     next_frame: Instant,
@@ -326,11 +331,11 @@ impl App {
                     }
                 }
                 OfficeEvent::ConnectionChanged => eprintln!("Офис: {}", self.office.status_line()),
-                OfficeEvent::Toast(t) => eprintln!("УВЕДОМЛЕНИЕ {} {} — {}{}", t.icon, t.title, t.body,
-                    if t.actions.is_empty() { String::new() } else {
-                        format!(" [{}]", t.actions.iter().map(|a| a.label.as_str()).collect::<Vec<_>>().join(" | "))
-                    }),
-                OfficeEvent::DismissToast(_) => {}
+                OfficeEvent::Toast(t) => {
+                    eprintln!("УВЕДОМЛЕНИЕ {} {} — {}", t.icon, t.title, t.body);
+                    self.toasts.post(text, t);
+                }
+                OfficeEvent::DismissToast(key) => self.toasts.dismiss_key(&key),
                 OfficeEvent::PeerWaves(id) => if let Some(p) = find_peer(overlays, &id) {
                     p.wave();
                     unsafe { p.say(gl, text, WAVE_TEXT, 2.5) };
@@ -353,12 +358,14 @@ impl App {
     /// Мышь ловим только над человечками; без человечков окно целиком «прозрачно» для кликов.
     fn update_input_regions(&mut self) {
         let Some(conn) = &self.x11 else { return };
+        let first_pos = self.overlays.first().map(|o| o.pos).unwrap_or_default();
         for o in &mut self.overlays {
             // Открыто меню — ловим клики по всему окну: клик мимо меню просто закрывает его
             let rects: Vec<Rectangle> = if o.menu.is_some() {
                 vec![Rectangle { x: 0, y: 0, width: o.width as u16, height: o.height as u16 }]
             } else {
-                o.peers.iter().flat_map(|p| p.hit_rects()).map(|(x, y, w, h)| {
+                let cards = if o.pos == first_pos { self.toasts.rects(o.width) } else { Vec::new() };
+                o.peers.iter().flat_map(|p| p.hit_rects()).chain(cards).map(|(x, y, w, h)| {
                     Rectangle { x: x.floor() as i16, y: y.floor() as i16, width: w.ceil() as u16, height: h.ceil() as u16 }
                 }).collect()
             };
@@ -382,7 +389,9 @@ impl App {
         let time = self.start.elapsed().as_secs_f32();
         let cpu_started = Instant::now();
         // Сначала второстепенные (без ожидания vsync), последним — основной, его swap ждёт кадр.
-        for overlay in self.overlays.iter_mut().rev() {
+        let toasts = &mut self.toasts;
+        toasts.tick(dt);
+        for (index, overlay) in self.overlays.iter_mut().enumerate().rev() {
             ctx.make_current(&overlay.surface).unwrap();
             unsafe {
                 gl.viewport(0, 0, overlay.width as i32, overlay.height as i32);
@@ -395,6 +404,9 @@ impl App {
                     p.tick(dt, overlay.width);
                     p.draw(gl, batch, now);
                 }
+                if index == 0 {
+                    toasts.draw(gl, batch, text, overlay.width);
+                }
                 if let Some(menu) = &mut overlay.menu {
                     let tex = menu.texture(gl, text, overlay.menu_dirty);
                     overlay.menu_dirty = false;
@@ -405,6 +417,7 @@ impl App {
             }
             overlay.surface.swap_buffers(ctx).unwrap();
         }
+        unsafe { self.toasts.sweep(gl) };
         let cpu = cpu_started.elapsed();
         self.update_input_regions();
 
@@ -457,6 +470,16 @@ impl App {
                 self.run(c);
             }
             return;
+        }
+        if index == 0 {
+            match self.toasts.click(self.overlays[0].width, cx, cy) {
+                Some(Click::Action(action)) => {
+                    self.perform(action);
+                    return;
+                }
+                Some(Click::Handled) => return,
+                None => {}
+            }
         }
         let Some(p) = self.overlays[index].peers.iter().rev().find(|p| p.contains(cx, cy)) else {
             eprintln!("Клик мимо человечка в ({cx:.0}, {cy:.0}) — не должен был дойти до окна");
@@ -594,14 +617,41 @@ impl App {
                 }
             }
             Command::Compose(to) => self.compose(to),
-            Command::Hide(id) | Command::Show(id) => {
-                let mut s = self.store.settings.clone();
-                if !s.hidden_peers.remove(&id) {
-                    s.hidden_peers.insert(id);
+            Command::Hide(id) => {
+                self.set_shown(&id, false);
+                let name = self.office.name(&id);
+                if let Some(text) = &mut self.text {
+                    self.toasts.post(text, Toast {
+                        icon: "🙈".into(), title: format!("{name} убран(а) с экрана"),
+                        body: "Писать и звать на чай по-прежнему можно. Вернуть: меню в трее → Коллеги.".into(),
+                        actions: vec![homeview::office::ToastAction { label: "Вернуть".into(),
+                                      kind: ActionKind::ShowPeer { id: id.clone() }, primary: false }],
+                        auto_dismiss: Duration::from_secs(8), key: Some(format!("hidden-{id}")),
+                    });
                 }
-                self.store.save(s.clone());
-                self.office.apply_settings(s);
             }
+            Command::Show(id) => self.set_shown(&id, true),
+        }
+        self.office_tick();
+    }
+
+    fn set_shown(&mut self, id: &str, shown: bool) {
+        let mut s = self.store.settings.clone();
+        if shown {
+            s.hidden_peers.remove(id);
+        } else {
+            s.hidden_peers.insert(id.to_string());
+        }
+        self.store.save(s.clone());
+        self.office.apply_settings(s);
+    }
+
+    /// Кнопка в уведомлении.
+    fn perform(&mut self, action: ActionKind) {
+        match action {
+            ActionKind::Compose { to } => self.compose(to),
+            ActionKind::ShowPeer { id } => self.set_shown(&id, true),
+            other => self.office.perform(&other),
         }
         self.office_tick();
     }
@@ -667,6 +717,15 @@ impl ApplicationHandler<()> for App {
                         return;
                     }
                     let o = &mut self.overlays[index];
+                    if index == 0 && o.menu.is_none() {
+                        if let Some(over_button) = self.toasts.hover(o.width, o.cursor.0, o.cursor.1) {
+                            if over_button != o.hovering {
+                                o.hovering = over_button;
+                                o.window.set_cursor(if over_button { CursorIcon::Pointer } else { CursorIcon::Default });
+                            }
+                            return;
+                        }
+                    }
                     if let Some(menu) = &mut o.menu {
                         if menu.hover(o.cursor.0, o.cursor.1) {
                             o.menu_dirty = true;
@@ -718,6 +777,7 @@ impl ApplicationHandler<()> for App {
 fn main() {
     let store = Store::load();
     let st = store.settings.clone();
+    let st_scale = st.toast_scale;
     let season = if st.season == "auto" { particles::season_for_today().to_string() } else { st.season.clone() };
     let mut opts = Options { small: false, seconds: 0.0, season, fps: st.fps as f32, density: st.density };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -744,9 +804,10 @@ fn main() {
     let waker = proxy.clone();
     let office = Office::new(st, Arc::new(move || { let _ = waker.send_event(()); }));
     let (compose_tx, compose_rx) = mpsc::channel();
+    let toasts = Toasts::new(st_scale);
     let mut app = App {
         opts, start: now, overlays: Vec::new(), context: None, particles: None, batch: None, text: None, x11: None,
-        root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None,
+        root: 0, store, office, art: Art::new(), last_idle_check: None, proxy, compose_tx, compose_rx, press: None, toasts,
         stats: Stats::default(), frame, next_frame: now, last_tick: now,
     };
     event_loop.run_app(&mut app).expect("run");
